@@ -20,6 +20,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/iq4_avx512.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include "ggml.h"
@@ -388,6 +389,62 @@ int check_engine_width(int type) {
 }
 #endif
 
+#if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
+// iq4_avx512.cpp (Cascade Lake's IQ4_XS gate/up and IQ4_NL down rows): against ggml's dot, and every token's rows the
+// same at 1..8 tokens (#152) - not bit-equal to the AVX-2 rows (the float additions are ordered differently)
+int check_iq4_512() {
+    if (cpu::cpu_avx512_ok() || !cpu::cpu_avx512bw_ok() || !cpu::cpu_evexvnni_ok()) {
+        std::printf("  iq4_512  not this CPU (AVX-512 BW + VNNI without VBMI only)\n");
+        return 0;
+    }
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt(23, 20, kH, kFF, f, err)) { std::printf("  iq4_512  %s\n", err.c_str()); return 1; }
+    std::vector<uint8_t> blob(f.bytes);
+    uint64_t seed = 0x14512000ull;
+    fill_blob(blob.data(), f, seed);
+    const Acts a(f, 4512u);
+    int failures = 0;
+    for (int part = 0; part < 2; ++part) {   // 0: gate/up (SwiGLU rows), 1: down rows
+        const size_t R = part == 0 ? (size_t) kFF : (size_t) kH;
+        std::vector<float> ref(kMaxT * R), one(kMaxT * R), o(kMaxT * R);
+        for (int t = 0; t < kMaxT; ++t)
+            for (size_t r = 0; r < R; ++r) {
+                if (part == 0) {
+                    float g = 0.f, u = 0.f;
+                    traits_cpu(23)->vec_dot((int) kH, &g, 0, blob.data() + r * f.gu_row, 0, a.gup[t], 0, 1);
+                    traits_cpu(23)->vec_dot((int) kH, &u, 0, blob.data() + f.up_off + r * f.gu_row, 0, a.gup[t], 0, 1);
+                    ref[t * R + r] = (g / (1.f + std::exp(-g))) * u;
+                } else {
+                    traits_cpu(20)->vec_dot((int) kFF, &ref[t * R + r], 0, blob.data() + f.down_off + r * f.d_row, 0,
+                                            a.dnp[t], 0, 1);
+                }
+            }
+        auto run = [&](int nt, const void* const* act, float* const* out) {
+            if (part == 0) cpu::iq4xs512_gu_rows(blob.data(), f.gu_row, f.up_off, (int) kH, act, nt, out, 0, (int) kFF);
+            else cpu::iq4nl512_down_rows(blob.data() + f.down_off, f.d_row, (int) kFF, act, nt, out, 0, (int) kH);
+        };
+        const void* const* act = part == 0 ? a.gup : a.dnp;
+        for (int t = 0; t < kMaxT; ++t) {
+            float* op = &one[t * R];
+            run(1, &act[t], &op);
+        }
+        const double r_ref = rel(one.data(), ref.data(), one.size());
+        size_t differ = 0;
+        for (int nt = 2; nt <= kMaxT; ++nt) {
+            float* op[kMaxT];
+            for (int t = 0; t < nt; ++t) op[t] = &o[t * R];
+            run(nt, act, op);
+            for (int t = 0; t < nt; ++t) differ += rows_differ(op[t], &one[t * R], R);
+        }
+        std::printf("  iq4_512  %s rows vs ggml vec_dot: rel %.2e; 2..8 tokens: %zu rows differ from the one-token rows\n",
+                    part == 0 ? "iq4_xs gate/up" : "iq4_nl down", r_ref, differ);
+        if (!(r_ref <= 1e-5) || differ) ++failures;
+    }
+    return failures;
+}
+#endif
+
 // ---- bench
 struct Method {
     std::string name;
@@ -571,6 +628,7 @@ int main(int argc, char** argv) {
     for (int type : {20, 42}) failures += check_down(type);
 #if !defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
     for (int type : {16, 17, 22, 18, 21, 23}) failures += check_engine_width(type);
+    failures += check_iq4_512();
 #endif
     std::printf("iq_avx2_parity: %d failures\n", failures);
     return failures == 0 ? 0 : 1;

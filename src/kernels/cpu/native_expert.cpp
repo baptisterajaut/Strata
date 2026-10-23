@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/iq4_avx512.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
@@ -367,6 +368,18 @@ int native_gu_mt_min(int gu_type) {
     return iq3s_one && gu_type == 21 ? 1 : mt_min;
 }
 
+// IQ4_XS gate/up and IQ4_NL down rows in 512-bit lanes (iq4_avx512.cpp) on the CPUs with AVX-512 BW/VL/DQ + VNNI but no
+// VBMI (Cascade Lake), where cpu_avx512_ok() is false and those formats took the AVX-2 rows.  The same group rule (#152)
+// as the AVX-2 rows; STRATA_NO_IQ4_512=1 keeps those.  Default arithmetic only: the window-invariant path keeps its
+// reference rows, like the AVX-2 rows do.
+// CBA: Cascade Lake only - a cpu_avx512_ok() CPU (Zen 4, Ice Lake) keeps ggml-cpu / the AVX-2 rows and their rounding;
+// it could take these too once measured there.
+static bool iq4_512_on() {
+    static const bool on = !cpu_avx512_ok() && cpu_avx512bw_ok() && cpu_evexvnni_ok() &&
+                           std::getenv("STRATA_NO_IQ4_512") == nullptr;
+    return on;
+}
+
 template <NativeArithmetic Arithmetic>
 void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
@@ -448,6 +461,10 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
     // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
     // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
+    if (!singleton_iq && nt >= mt_min && f.gu_type == 23 && iq4_512_on()) {
+        iq4xs512_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (singleton_iq) {
@@ -531,6 +548,11 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8) &&
         (Arithmetic == NativeArithmetic::Default || (ggml_cpu_has_avx2() && ggml_cpu_has_fma()))) {   // Q5_1 / Q8_0 down: bit-exact, any group size
         kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
+    if ((Arithmetic == NativeArithmetic::Default || mt_min <= 1) && nt >= mt_min && f.d_type == 20 && iq4nl_mt &&
+        f.n_ff % 64 == 0 && iq4_512_on()) {   // two blocks a vector
+        iq4nl512_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (cpu_avx2_ok() && nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows
