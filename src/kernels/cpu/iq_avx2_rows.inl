@@ -3,6 +3,8 @@
 //   STRATA_ROWS_VNNI 0   the AVX2 forms (namespace plain);
 //   STRATA_ROWS_VNNI 1   the same loops with AVX-VNNI (namespace vnni, built with STRATA_AVXVNNI): vpdpwssd for each
 //                        madd + add, vpdpbusd for maddubs + madd(ones).  Integer sums, so the same bits.
+//   STRATA_ROWS_VNNI 2   the same instructions EVEX-encoded (namespace evex, built with STRATA_EVEXVNNI, called only
+//                        where cpu_evexvnni_ok() and not cpu_avxvnni_ok()): AVX512-VNNI + VL, still 256-bit lanes.
 //
 // Every function here is STRATA_ROWS_FN: nothing in the plain copy, GCC/Clang's target("avxvnni") in the VNNI copy, so
 // the AVX-VNNI intrinsics compile in these functions only and the plain copy stays AVX2 (-mavxvnni on the whole file
@@ -11,7 +13,9 @@
 
 // acc + madd(p16, sc).  vpdpwssd is the madd and the add in one uop; both wrap the same way.
 STRATA_ROWS_FN inline __m256i madd_add(__m256i acc, __m256i p16, __m256i sc) {
-#if STRATA_ROWS_VNNI
+#if STRATA_ROWS_VNNI == 2
+    return _mm256_dpwssd_epi32(acc, p16, sc);
+#elif STRATA_ROWS_VNNI
     return _mm256_dpwssd_avx_epi32(acc, p16, sc);
 #else
     return _mm256_add_epi32(acc, _mm256_madd_epi16(p16, sc));
@@ -21,7 +25,9 @@ STRATA_ROWS_FN inline __m256i madd_add(__m256i acc, __m256i p16, __m256i sc) {
 // Four u8 x s8 products per int32 lane.  vpdpbusd does not saturate where maddubs would, but maddubs cannot here: the
 // u8 side is an IQ4_NL |w| <= 127, so a pair is at most 2 * 127 * 128.
 STRATA_ROWS_FN inline __m256i dot4u(__m256i u8, __m256i s8) {
-#if STRATA_ROWS_VNNI
+#if STRATA_ROWS_VNNI == 2
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), u8, s8);
+#elif STRATA_ROWS_VNNI
     return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), u8, s8);
 #else
     return _mm256_madd_epi16(_mm256_maddubs_epi16(u8, s8), _mm256_set1_epi16(1));

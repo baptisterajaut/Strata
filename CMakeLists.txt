@@ -1813,11 +1813,30 @@ int main() {
     return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
 }
 ]=] STRATA_HAVE_AVXVNNI_INTRINSICS)
+# The same instructions EVEX-encoded (AVX512-VNNI + AVX512VL, 256-bit lanes): Cascade Lake, Ice Lake, Zen 4 - CPUs
+# with AVX512-VNNI but no AVX-VNNI.  A third copy of the rows under target("avx512vnni,avx512vl"), taken where
+# cpu_evexvnni_ok() and not cpu_avxvnni_ok().  The same integer sums, so the same bits.
+check_cxx_source_compiles([=[
+#include <immintrin.h>
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx512vnni,avx512vl")))
+#endif
+static __m256i dots(__m256i a, __m256i b) { return _mm256_dpbusd_epi32(_mm256_dpwssd_epi32(a, a, b), a, b); }
+int main() {
+    volatile int x = 1;
+    return _mm256_extract_epi32(dots(_mm256_set1_epi32(x), _mm256_set1_epi32(x)), 0) == 0;
+}
+]=] STRATA_HAVE_EVEXVNNI_INTRINSICS)
 unset(CMAKE_REQUIRED_FLAGS)
 if(STRATA_HAVE_AVXVNNI_INTRINSICS)
   set(_strata_avxvnni STRATA_AVXVNNI=1)
 else()
   set(_strata_avxvnni STRATA_AVXVNNI=0)
+endif()
+if(STRATA_HAVE_EVEXVNNI_INTRINSICS)
+  list(APPEND _strata_avxvnni STRATA_EVEXVNNI=1)
+else()
+  list(APPEND _strata_avxvnni STRATA_EVEXVNNI=0)
 endif()
 set_property(SOURCE src/kernels/cpu/q2_avx2.cpp APPEND PROPERTY COMPILE_DEFINITIONS ${_strata_avxvnni})
 find_package(Threads REQUIRED)

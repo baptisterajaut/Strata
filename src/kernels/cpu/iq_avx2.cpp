@@ -44,6 +44,15 @@
 #else
 #define STRATA_AVXVNNI_FN
 #endif
+// STRATA_EVEXVNNI (CMake: the compiler has the AVX512-VNNI intrinsics): the third copy, target("avx512vnni,avx512vl")
+#if !defined(STRATA_EVEXVNNI)
+#define STRATA_EVEXVNNI 0
+#endif
+#if STRATA_EVEXVNNI && (defined(__GNUC__) || defined(__clang__))
+#define STRATA_EVEXVNNI_FN __attribute__((target("avx512vnni,avx512vl")))
+#else
+#define STRATA_EVEXVNNI_FN
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -380,8 +389,17 @@ namespace vnni {
 #include "iq_avx2_rows.inl"
 }  // namespace vnni
 #endif
+#if STRATA_EVEXVNNI
+namespace evex {
+#define STRATA_ROWS_VNNI 2
+#define STRATA_ROWS_FN STRATA_EVEXVNNI_FN
+#include "iq_avx2_rows.inl"
+}  // namespace evex
+#endif
 
-bool vnni_on() { return STRATA_AVXVNNI && cpu_avxvnni_ok(); }
+// The VEX copy where the CPU has AVX-VNNI, else the EVEX one (Cascade Lake, Ice Lake, Zen 4): kIq256Vnni is either.
+bool vex_on() { return STRATA_AVXVNNI && cpu_avxvnni_ok(); }
+bool vnni_on() { return vex_on() || (STRATA_EVEXVNNI && cpu_evexvnni_ok()); }
 
 }  // namespace
 
@@ -458,7 +476,7 @@ void iq256_gu_rows_exact_one(int type, const uint8_t* blob, size_t gu_row, size_
                              const void* act, float* ff, int r0, int r1) {
     const auto* y = (const block_q8_K*) act;
 #if STRATA_AVXVNNI
-    if (vnni_on()) {
+    if (vex_on()) {   // the EVEX copy is not wired here: plain on those CPUs, the same bits
         if (type == 16) vnni::gu_ggml_one<16>(blob, gu_row, up_off, n, y, ff, r0, r1);
         else if (type == 17) vnni::gu_ggml_one<17>(blob, gu_row, up_off, n, y, ff, r0, r1);
         else if (type == 18) {
@@ -501,9 +519,16 @@ void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, 
                      const void* const* act, int nt, float* const* ff, int r0, int r1) {
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
-    if (variant & kIq256Vnni) {
+    if ((variant & kIq256Vnni) && vex_on()) {
         if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
         else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        return;
+    }
+#endif
+#if STRATA_EVEXVNNI
+    if (variant & kIq256Vnni) {
+        if (g) evex::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        else evex::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
         return;
     }
 #endif
@@ -515,9 +540,16 @@ void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int
                   float* const* out, int r0, int r1) {
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
-    if (variant & kIq256Vnni) {
+    if ((variant & kIq256Vnni) && vex_on()) {
         if (g) vnni::dot_type<true>(type, nt, w, row_bytes, n, act, out, r0, r1);
         else vnni::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
+        return;
+    }
+#endif
+#if STRATA_EVEXVNNI
+    if (variant & kIq256Vnni) {
+        if (g) evex::dot_type<true>(type, nt, w, row_bytes, n, act, out, r0, r1);
+        else evex::dot_type<false>(type, nt, w, row_bytes, n, act, out, r0, r1);
         return;
     }
 #endif
@@ -557,8 +589,14 @@ void iq4nl256_down_rows_v(int variant, const uint8_t* w, size_t row_bytes, int n
     const block_q8_0* y[8];
     for (int t = 0; t < nt; ++t) y[t] = (const block_q8_0*) hq[t];
 #if STRATA_AVXVNNI
-    if (variant & kIq256Vnni) {
+    if ((variant & kIq256Vnni) && vex_on()) {
         vnni::iq4nl_nt(w, row_bytes, n, y, nt, out, r0, r1);
+        return;
+    }
+#endif
+#if STRATA_EVEXVNNI
+    if (variant & kIq256Vnni) {
+        evex::iq4nl_nt(w, row_bytes, n, y, nt, out, r0, r1);
         return;
     }
 #endif
