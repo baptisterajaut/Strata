@@ -265,6 +265,17 @@ inline int64_t cpu_share_max() {
     if (g_share_default && cpu_share_explicit() == -2.0 && !explicit_max) return kStreamAllMinDefault;   // its measured range
     return v;
 }
+// STRATA_PREFILL_CPU_TOKENS (default MAXT, 8): the most tokens an expert may have to go to the CPU share.  Above MAXT the
+// expert goes to the pool as several jobs of at most MAXT tokens, each reading the whole blob again: on a slow link
+// (PCIe 3, 12.3 GB/s: 0.21 ms per 2.5 MB IQ4_XS expert) a 20-token expert can still be cheaper on the CPU than on the
+// wire.  The CPU's rows stay within the buffer the MAXT limit sizes (MAXT x n_expert rows), so no new pinned memory.
+inline int32_t cpu_share_tokens() {
+    static const int32_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_CPU_TOKENS");
+        return e ? std::clamp(std::atoi(e), 1, 256) : strata::kernels::cpu::MAXT;
+    }();
+    return v;
+}
 // On a layer split every stage may have the pool (set_cpu_pool), and the stages read different chunks at the same time:
 // one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
 std::atomic<bool> g_cpu_pool_busy{false};
@@ -4457,7 +4468,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 ++nstream;
                                 // a blob the CPU reads from RAM: page-locked, or any other that is not assembled into a
                                 // short-lived buffer (the arena's unpinned part, the mapped experts.bin's pages)
-                                if (c <= strata::kernels::cpu::MAXT && (m.src->pinned(l, e) || !m.src->transient(l, e)))
+                                if (c <= cpu_share_tokens() && (m.src->pinned(l, e) || !m.src->transient(l, e)))
                                     cand.emplace_back(c, e);
                             }
                             std::sort(cand.begin(), cand.end());
@@ -4467,8 +4478,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // The CPU thread touches no ExpertSource (its blob() counts reads without a lock, and its
                             // calls race with this thread's own blob_stable()/pinned() ones): the pointers are taken
                             // here, and an expert without a stable blob stays on the GPU.
+                            const int64_t rows_cap = (int64_t) (m.cpu_rows_n / (size_t) N);   // see cpu_share_tokens
                             for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
                                 const int32_t e = cand[i].second;
+                                if (rows_cpu + cand[i].first > rows_cap) break;   // sorted: every later one is as big
                                 const uint8_t* b = m.src->blob_stable(l, e);
                                 if (b == nullptr) continue;
                                 if (on_cpu.empty()) {
@@ -4634,16 +4647,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.cpu_jobs.clear();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     if (!on_cpu[(size_t) e]) continue;
-                                    strata::kernels::cpu::ExpertJobMulti j;
-                                    j.blob = cpu_blob[(size_t) e];
-                                    j.nt = m.cnt[(size_t) e];
-                                    for (int r = 0; r < j.nt; ++r) {
-                                        const int64_t p = (int64_t) m.off[(size_t) e] + r;
-                                        if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
-                                        else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
-                                        j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                    // above MAXT tokens (STRATA_PREFILL_CPU_TOKENS): one job per MAXT of them, same blob
+                                    for (int32_t t0 = 0; t0 < m.cnt[(size_t) e]; t0 += strata::kernels::cpu::MAXT) {
+                                        strata::kernels::cpu::ExpertJobMulti j;
+                                        j.blob = cpu_blob[(size_t) e];
+                                        j.nt = std::min<int32_t>(m.cnt[(size_t) e] - t0, strata::kernels::cpu::MAXT);
+                                        for (int r = 0; r < j.nt; ++r) {
+                                            const int64_t p = (int64_t) m.off[(size_t) e] + t0 + r;
+                                            if (q2) j.act[r] = &m.cpu_actq[(size_t) src_h[(size_t) p]];
+                                            else j.nact[r] = m.cpu_nact.data() + (size_t) src_h[(size_t) p] * AB;
+                                            j.out[r] = m.cpu_rows + (size_t) (p - r0c) * N;
+                                        }
+                                        m.cpu_jobs.push_back(j);
                                     }
-                                    m.cpu_jobs.push_back(j);
                                 }
                                 cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());
                                 cpu_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
