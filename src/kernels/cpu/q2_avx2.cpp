@@ -24,6 +24,14 @@
 #else
 #define STRATA_AVXVNNI_FN
 #endif
+#if !defined(STRATA_EVEXVNNI)
+#define STRATA_EVEXVNNI 0
+#endif
+#if STRATA_EVEXVNNI && (defined(__GNUC__) || defined(__clang__))
+#define STRATA_EVEXVNNI_FN __attribute__((target("avx512vnni,avx512vl")))
+#else
+#define STRATA_EVEXVNNI_FN
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -60,6 +68,13 @@ namespace vnni {
 #define STRATA_ROWS_FN STRATA_AVXVNNI_FN
 #include "q2_avx2_rows.inl"
 }  // namespace vnni
+#endif
+#if STRATA_EVEXVNNI
+namespace evex {   // AVX512-VNNI + VL, where the CPU has no AVX-VNNI (iq_avx2.cpp)
+#define STRATA_ROWS_VNNI 2
+#define STRATA_ROWS_FN STRATA_EVEXVNNI_FN
+#include "q2_avx2_rows.inl"
+}  // namespace evex
 #endif
 
 // ================================ the "bit-plane" row dot (opt-in: STRATA_Q2_BITPLANE=1) ================================
@@ -155,8 +170,14 @@ bool q2_bitplane_enabled() { return kBitplane; }
 void q2_0_gguf_rows_multi_avx2_v(bool vnni_rows, const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
                                  int nt, float* const* out, int r0, int r1) {
 #if STRATA_AVXVNNI
-    if (vnni_rows) {
+    if (vnni_rows && cpu_avxvnni_ok()) {
         vnni::rows_nt(w, row_bytes, nblocks, a, nt, out, r0, r1);
+        return;
+    }
+#endif
+#if STRATA_EVEXVNNI
+    if (vnni_rows) {
+        evex::rows_nt(w, row_bytes, nblocks, a, nt, out, r0, r1);
         return;
     }
 #endif
@@ -166,7 +187,7 @@ void q2_0_gguf_rows_multi_avx2_v(bool vnni_rows, const uint8_t* w, size_t row_by
 
 void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                       float* const* out, int r0, int r1) {
-    q2_0_gguf_rows_multi_avx2_v(STRATA_AVXVNNI && cpu_avxvnni_ok(), w, row_bytes, nblocks, a, nt, out, r0, r1);
+    q2_0_gguf_rows_multi_avx2_v((STRATA_AVXVNNI && cpu_avxvnni_ok()) || (STRATA_EVEXVNNI && cpu_evexvnni_ok()), w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,

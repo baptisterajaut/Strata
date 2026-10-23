@@ -310,6 +310,18 @@ bool cpu_avxvnni_ok() {
     return ok;
 }
 
+bool cpu_evexvnni_ok() {
+    static const bool ok = [] {
+        if (const char* v = std::getenv("STRATA_NO_AVXVNNI"); v != nullptr && std::atoi(v) != 0) return false;
+        // EVEX-encoded: the AVX-512 state and AVX512VL (cpu_avx512bw_ok, which STRATA_FORCE_AVX2 turns off)
+        if (isa_floor_build()[0] != '\0' || cpu_isa_cap() < 3 || !cpu_avx2_ok() || !cpu_avx512bw_ok()) return false;
+        unsigned r[4];
+        cpuid_regs(7, 0, r);
+        return ((r[2] >> 11) & 1u) != 0;       // AVX512-VNNI
+    }();
+    return ok;
+}
+
 std::string cpu_name() {
     unsigned r[12] = {};
 #if defined(_MSC_VER)

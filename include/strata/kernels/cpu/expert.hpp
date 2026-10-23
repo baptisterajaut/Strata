@@ -189,7 +189,8 @@ bool q2_bitplane_enabled();
 /// The pre-bit-plane AVX-2 kernel (the default), kept for A/B and parity.
 void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                       float* const* out, int r0, int r1);
-/// The same rows with AVX-VNNI on or off, not as cpu_avxvnni_ok() says (tests and benches; on only where it holds).
+/// The same rows with VNNI on or off (AVX-VNNI, else its EVEX form), not as cpu_avxvnni_ok() / cpu_evexvnni_ok() say
+/// (tests and benches; on only where one holds).
 void q2_0_gguf_rows_multi_avx2_v(bool vnni, const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
                                  int nt, float* const* out, int r0, int r1);
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);

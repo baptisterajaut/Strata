@@ -6,7 +6,9 @@
 // + madd(ones) take two on the multiply ports; maddubs cannot saturate (a pair is at most 2 * 3 * 128), so the sums
 // are the same.
 STRATA_ROWS_FN inline __m256i dot4(__m256i codes, __m256i act) {
-#if STRATA_ROWS_VNNI
+#if STRATA_ROWS_VNNI == 2   // EVEX (namespace evex, AVX512-VNNI + VL)
+    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), codes, act);
+#elif STRATA_ROWS_VNNI
     return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), codes, act);
 #else
     return _mm256_madd_epi16(_mm256_maddubs_epi16(codes, act), _mm256_set1_epi16(1));
