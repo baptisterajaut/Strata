@@ -10,6 +10,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/iq4_avx512.hpp"
 #include "strata/kernels/cpu/kq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
@@ -116,6 +117,12 @@ void iq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*,
 }
 void iq512_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-512 i-quant kernel");
+}
+void iq4xs512_gu_rows(const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-512 IQ4 kernel");
+}
+void iq4nl512_down_rows(const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-512 IQ4 kernel");
 }
 bool iq512_gather_on() noexcept { return false; }
 bool iq512x_supported(int) noexcept { return false; }
