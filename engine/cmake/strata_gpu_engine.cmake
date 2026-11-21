@@ -559,7 +559,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(strata-ink2ref PRIVATE strata_warnings ${_strata_gpu_runtime_target})
     # T2 engine path for the same family: --serve (engine protocol), chunked prefill (cuBLAS), decode graph captured on
     # the per-thread default stream
-    add_executable(strata-ink2 src/inkling2/ink2_engine.cu)
+    add_executable(strata-ink2 src/inkling2/ink2_engine.cu src/inkling2/ink2_cpu.cpp)
+    set_source_files_properties(src/inkling2/ink2_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma;-mf16c")
     target_include_directories(strata-ink2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(strata-ink2 PRIVATE strata_warnings ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
     target_compile_options(strata-ink2 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>)

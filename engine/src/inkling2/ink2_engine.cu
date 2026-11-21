@@ -53,6 +53,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+inline double now_ms() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// ink2_cpu.cpp (outside the anonymous namespace)
+float ink2_cpu_dot(int type, const uint8_t* row, const float* x, int K);
+void ink2_cpu_pool_start(int workers);
+void ink2_cpu_pool_run(int n, void (*fn)(int, void*), void* ctx);
+
 namespace {
 
 using vec = std::vector<float>;
@@ -2820,6 +2828,15 @@ void load() {
     }
 }
 
+// CPU experts (INK2_CPU_MISS=1, host-LRU decode): ink2_cpu.cpp (g++, AVX2): row dots over ggml blocks and a spin pool
+struct CpuPool {
+    void start(int w) { ink2_cpu_pool_start(w); }
+    template <class F> void run(int n, F f) {
+        ink2_cpu_pool_run(n, [](int i, void* c) { (*static_cast<F*>(c))(i); }, &f);
+    }
+};
+static inline float cpu_dot(int t, const uint8_t* row, const float* x, int K) { return ink2_cpu_dot(t, row, x, K); }
+
 // ---------------------------------------------------------------------------------------------------------------------
 // GGUF reader (one file, mapped read-only) and the loader for llama.cpp's merged inkling2_loop layout
 struct GgTensor { uint32_t type = 0; int64_t ne[4] = {1, 1, 1, 1}; int nd = 0; const uint8_t* data = nullptr; size_t bytes = 0; };
@@ -3608,6 +3625,17 @@ struct HostLru {
     cudaStream_t cs = nullptr;
     cudaEvent_t ev_main = nullptr, ev_copy = nullptr;
     unsigned long long bytes = 0;
+    // INK2_CPU_MISS: misses computed on the CPU; their background copies make a slot resident once landed
+    bool cpu = true;               // INK2_CPU_MISS (default on with host LRU; 0: copy the misses and wait)
+    std::vector<int> pend;         // slot -> pending copy event (index into pev), -1 ready
+    cudaEvent_t pev[512];
+    int pnext = 0;
+    float *h_x = nullptr, *h_ey = nullptr, *h_gu = nullptr;   // pinned: the MoE input, the misses' outputs, scratch
+    CpuPool pool;
+    unsigned long long cpu_experts = 0;
+    double t_cpu = 0, t_sync = 0, t_wait = 0, t_pa = 0, t_sw = 0, t_pb = 0;   // INK2_CPU_TIME=1: ms in the CPU experts, the routing read-back, GPU idle wait
+    long long n_layers = 0, n_miss_layers = 0;
+    bool timing = false;
 } HL;
 void hl_pull() {   // the device's residency into the host mirror (recency: unchanged owners keep theirs)
     std::vector<int> so((size_t) NL * NE), ow(E.nslot_nv);
@@ -3629,26 +3657,47 @@ void hl_init() {
     CK(cudaStreamCreateWithFlags(&HL.cs, cudaStreamNonBlocking));
     CK(cudaEventCreateWithFlags(&HL.ev_main, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&HL.ev_copy, cudaEventDisableTiming));
+    if (HL.cpu) {
+        for (auto& e : HL.pev) { CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); CK(cudaEventRecord(e, cudaStreamPerThread)); }
+        CK(cudaHostAlloc((void**) &HL.h_x, H * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &HL.h_ey, (size_t) TOPK * H * 4, cudaHostAllocDefault));
+        CK(cudaHostAlloc((void**) &HL.h_gu, (size_t) TOPK * 2 * FF * 4, cudaHostAllocDefault));
+        int w = (int) std::thread::hardware_concurrency() / 2 - 1;
+        if (const char* r = std::getenv("INK2_CPU_THREADS")) w = std::atoi(r) - 1;
+        HL.pool.start(std::max(0, w));
+    }
     hl_pull();
+    HL.pend.assign(E.nslot_nv, -1);
 }
 // layer l's routed experts resident: returns the number of misses (their copies and table entries queued on HL.cs,
 // HL.ev_copy recorded after them); the hit / miss flags are on the device in g_mflag
-int hl_plan(int l) {
+int hl_plan(int l, const float* x = nullptr, int* mk = nullptr) {
     CK(cudaMemcpyAsync(HL.h_ids, E.ids, TOPK * 4, cudaMemcpyDeviceToHost));
+    if (x) CK(cudaMemcpyAsync(HL.h_x, x, H * 4, cudaMemcpyDeviceToHost));
+    const double ts = HL.timing ? now_ms() : 0;
     CK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (HL.timing) { HL.t_sync += now_ms() - ts; ++HL.n_layers; }
+    if (HL.pend.size() < (size_t) E.nslot_nv) HL.pend.resize(E.nslot_nv, -1);
     const uint64_t t = ++HL.tick;
     const int k = HL.ring++ & 63;
     CK(cudaEventSynchronize(HL.ev_ring[k]));
     int* flag = HL.h_flag + k * TOPK;
     int nm = 0, miss[TOPK];
+    int nc = 0;   // CPU mode: misses whose copy is already on its way (computed on the CPU, not copied again)
     for (int i = 0; i < TOPK; ++i) {
         const int key = l * NE + HL.h_ids[i], s2 = HL.slot_of[key];
-        flag[i] = s2 < 0;
-        if (s2 >= 0) HL.last[s2] = t; else miss[nm++] = i;
+        bool hit = s2 >= 0;
+        if (hit && HL.cpu && HL.pend[s2] >= 0) {
+            if (cudaEventQuery(HL.pev[HL.pend[s2]]) == cudaSuccess) HL.pend[s2] = -1;
+            else { hit = false; HL.last[s2] = t; if (mk) mk[nc++] = i; flag[i] = 1; continue; }
+        }
+        flag[i] = !hit;
+        if (hit) HL.last[s2] = t; else miss[nm++] = i;
     }
     CK(cudaMemcpyAsync(g_mflag, flag, TOPK * 4, cudaMemcpyHostToDevice));
     CK(cudaEventRecord(HL.ev_ring[k], cudaStreamPerThread));
-    if (!nm) return 0;
+    if (mk) for (int j = 0; j < nm; ++j) mk[nc + j] = miss[j];
+    if (!nm) return nc;
     CK(cudaEventRecord(HL.ev_main, cudaStreamPerThread));   // the victims' last readers are queued before this
     CK(cudaStreamWaitEvent(HL.cs, HL.ev_main, 0));
     const size_t eb = ex_bytes(l), pa = ex_partA(l);
@@ -3679,10 +3728,50 @@ int hl_plan(int l) {
         HL.slot_of[key] = v;
         HL.last[v] = t;
         HL.bytes += eb;
+        if (HL.cpu) {   // resident once this copy has landed
+            const int pe = HL.pnext++ & 511;
+            CK(cudaEventRecord(HL.pev[pe], HL.cs));
+            HL.pend[v] = pe;
+        }
     }
     // the device's own plan state follows (slot_of / owner): a later device plan (short prompts) must agree
     CK(cudaEventRecord(HL.ev_copy, HL.cs));
-    return nm;
+    return nm + nc;
+}
+// CPU: the missed experts mk[0..m) of layer l on the MoE input HL.h_x -> HL.h_ey rows (fp32, gate_up then SwiGLU then
+// down), the work spread over the pool in 64-row pieces
+void hl_cpu_experts(int l, const Experts& X, const int* mk, int m) {
+    const size_t eb = ex_bytes(l), pa = ex_partA(l);
+    const uint8_t* base = E.xhost + ex_layer_off(l);
+    constexpr int RP = 64;
+    const int pa_n = 2 * FF / RP, pb_n = H / RP;
+    const double t0 = HL.timing ? now_ms() : 0;
+    HL.pool.run(m * pa_n, [&](int i) {
+        const int j = i / pa_n, r0 = (i % pa_n) * RP, e = HL.h_ids[mk[j]];
+        const uint8_t* W = base + (size_t) e * eb;
+        float* gu = HL.h_gu + (size_t) j * 2 * FF;
+        for (int r = r0; r < r0 + RP; ++r) gu[r] = cpu_dot(X.gg13, W + (size_t) r * X.rb13, HL.h_x, H);
+    });
+    const double t1 = HL.timing ? now_ms() : 0;
+    constexpr int SWP = 128;   // SwiGLU: gate rows 0..FF, up rows FF..2FF (the file's order) -> act in place
+    HL.pool.run(m * (FF / SWP), [&](int i) {
+        float* gu = HL.h_gu + (size_t) (i / (FF / SWP)) * 2 * FF;
+        const int a0 = (i % (FF / SWP)) * SWP;
+        for (int k2 = a0; k2 < a0 + SWP; ++k2) {
+            const float g = gu[k2], u = gu[FF + k2];
+            gu[k2] = (std::tanh(g / GATE_CAP) * GATE_CAP) * (1.0f / (1.0f + std::exp(-g))) * (std::tanh(u / UP_CAP) * UP_CAP);
+        }
+    });
+    const double t2 = HL.timing ? now_ms() : 0;
+    HL.pool.run(m * pb_n, [&](int i) {
+        const int j = i / pb_n, r0 = (i % pb_n) * RP, e = HL.h_ids[mk[j]];
+        const uint8_t* W = base + (size_t) e * eb + pa;
+        const float* act = HL.h_gu + (size_t) j * 2 * FF;
+        float* ey = HL.h_ey + (size_t) mk[j] * H;
+        for (int r = r0; r < r0 + RP; ++r) ey[r] = cpu_dot(X.gg2, W + (size_t) r * X.rb2, act, FF);
+    });
+    HL.cpu_experts += m;
+    if (HL.timing) { HL.t_pa += t1 - t0; HL.t_sw += t2 - t1; HL.t_pb += now_ms() - t2; }
 }
 
 void moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out) {
@@ -3694,6 +3783,26 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
         CK(cudaStreamWaitEvent(cudaStreamPerThread, g_dec_join, 0));
         g_dec_pending = false;
         if (g_pred_st) k_pred_stat<<<1, 32>>>(g_dec_ids, E.ids, g_pred_st);
+    }
+    if (g_hl && E.xhost && Y.ex.gg13 && HL.cpu) {   // host LRU, the misses on the CPU beside the GPU's hits
+        const Experts& X = Y.ex;
+        const int l = int(&Y - E.L);
+        int mk[TOPK];
+        const int m = hl_plan(l, x, mk);
+        g_sel_mode = m ? 1 : 0;
+        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+        g_sel_mode = 0;
+        if (m) {
+            const double tc = HL.timing ? now_ms() : 0;
+            hl_cpu_experts(l, X, mk, m);
+            if (HL.timing) { HL.t_cpu += now_ms() - tc; ++HL.n_miss_layers; }
+            for (int j = 0; j < m; ++j)
+                CK(cudaMemcpyAsync(E.ey + (size_t) mk[j] * H, HL.h_ey + (size_t) mk[j] * H, H * 4, cudaMemcpyHostToDevice));
+        }
+        k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);
+        ++g_dec_app;
+        return;
     }
     if (g_hl && E.xhost && Y.ex.gg13) {   // host LRU: DMA copies of the misses beside the hit experts' GEMVs
         const Experts& X = Y.ex;
@@ -4544,9 +4653,6 @@ std::vector<int> parse_ids(const char* s) {
     return v;
 }
 
-double now_ms() {
-    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 // sampling on the host (the engine samples; Strata's server only forwards the keys): greedy without a temperature
 struct Sampler {
@@ -4838,6 +4944,8 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
     if (const char* r = std::getenv("INK2_SPLIT")) g_split = std::atoi(r) != 0;
     if (const char* r = std::getenv("INK2_HOSTLRU")) g_hl = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_CPU_MISS")) HL.cpu = std::atoi(r) != 0;
+    HL.timing = std::getenv("INK2_CPU_TIME") != nullptr;
     if (const char* r = std::getenv("INK2_SPLIT_BLOCKS")) g_split_blocks = std::atoi(r);
     {
         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : 1;
@@ -5134,6 +5242,13 @@ int main(int argc, char** argv) {
     }
     CK(cudaDeviceSynchronize());
     const double t2 = now_ms();
+    if (HL.timing && HL.n_layers)
+        std::fprintf(stderr, "cpu misses: %lld layer applications, %lld with misses, %llu experts on the CPU; per application "
+                             "read-back wait %.3f ms, per application with misses CPU %.3f ms\n", HL.n_layers, HL.n_miss_layers,
+                     HL.cpu_experts, HL.t_sync / HL.n_layers, HL.n_miss_layers ? HL.t_cpu / HL.n_miss_layers : 0.0);
+    if (HL.timing && HL.cpu_experts)
+        std::fprintf(stderr, "cpu misses: per expert gate_up %.3f ms, SwiGLU %.3f ms, down %.3f ms\n", HL.t_pa / HL.cpu_experts,
+                     HL.t_sw / HL.cpu_experts, HL.t_pb / HL.cpu_experts);
     if (E.xhost) {
         CK(cudaMemcpy(&fb2, E.fbytes, 8, cudaMemcpyDeviceToHost));
         size_t fr = 0, tot = 0;
