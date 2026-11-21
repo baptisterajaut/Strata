@@ -843,7 +843,8 @@ __constant__ int c_kvm;   // 3 = int8 with Walsh-Hadamard rotation (Strata's kv_
                           // the attention output rotated back (H orthonormal and symmetric: scores unchanged);
                           // 4 = k8v4: K as in 2, V rotated as in 3 and stored as 4-bit codes [cap][KVD / 2] (low nibble
                           // first) with one fp16 scale per 32 values [cap][KVD / 32]; q is not rotated (K is not)
-__host__ __device__ constexpr bool kv_rot_v(int kvm) { return kvm == 3 || kvm == 4; }   // the output is rotated back
+                          // 5 = k8v8: K as in 2, V rotated as in 3 and stored int8 as in 2; q not rotated
+__host__ __device__ constexpr bool kv_rot_v(int kvm) { return kvm >= 3; }   // the output is rotated back
 // orthonormal Walsh-Hadamard transform of one 128-vector held one value per thread by a 128-thread block
 __device__ __forceinline__ float wht128(float x) {
     __shared__ float r[128];
@@ -896,7 +897,7 @@ template <bool VV>
 __device__ __forceinline__ void kv_st(void* B, __half* sc, size_t row, int e, float x) {
     if (c_kvm == 0) { static_cast<float*>(B)[row * KVD + e] = x; return; }
     if (c_kvm == 1) { static_cast<__half*>(B)[row * KVD + e] = __float2half_rn(x); return; }
-    if (c_kvm == 3 || (VV && c_kvm == 4)) x = wht128(x);
+    if (c_kvm == 3 || (VV && c_kvm >= 4)) x = wht128(x);
     if (VV && c_kvm == 4) {   // a warp holds one group of 32: scale = fp16(max|x| / 7), code = clamp(rint(x / s), -7, 7) + 8
         const float m = warp_max(fabsf(x));
         const __half sh = __float2half_rn(m / 7.0f);
@@ -3907,8 +3908,8 @@ int main(int argc, char** argv) {
         else if (a == "--kv-grow-step") E.grow_step = std::max(CHUNK, std::atoi(v) / CHUNK * CHUNK);
         else if (a == "--kv") {
             const std::string k = v;
-            E.kvm = k == "k8v4" ? 4 : k == "i8r" ? 3 : k == "i8" ? 2 : k == "f32" ? 0 : k == "f16" ? 1 : -1;
-            if (E.kvm < 0) { std::fprintf(stderr, "--kv f16|f32|i8|i8r|k8v4\n"); return 2; }
+            E.kvm = k == "k8v8" ? 5 : k == "k8v4" ? 4 : k == "i8r" ? 3 : k == "i8" ? 2 : k == "f32" ? 0 : k == "f16" ? 1 : -1;
+            if (E.kvm < 0) { std::fprintf(stderr, "--kv f16|f32|i8|i8r|k8v4|k8v8\n"); return 2; }
         }
         else if (a == "--record-routing") { rec_path = v; E.rec_mode = 1; }
         else if (a == "--force-routing") { rec_path = v; E.rec_mode = 2; }
@@ -3917,7 +3918,7 @@ int main(int argc, char** argv) {
     if (E.grow) vmm_init();
     if (dir.empty() || (ids.empty() && !serve)) {
         std::fprintf(stderr, "usage: strata-ink2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
-                             "[--chunk N] [--tc 0|1] [--kv f16|f32|i8|i8r|k8v4] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N] [--dump-logits F]\n");
+                             "[--chunk N] [--tc 0|1] [--kv f16|f32|i8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N] [--dump-logits F]\n");
         return 2;
     }
     if (serve && PF.TP <= 0) { std::fprintf(stderr, "--serve needs --chunk > 0\n"); return 2; }
