@@ -525,6 +525,89 @@ __global__ void __launch_bounds__(256) k_gemv_gg_q8(const uint8_t* const* __rest
     if (!lane) y[(size_t) blockIdx.y * N + o] = acc;
 }
 
+// decode expert GEMV, 32 weights per lane step (INK2_GG_RPW=32): one IQ3_S sub-block / IQ4_NL / Q8_0 block per unit,
+// so the block header (scale, high bits, signs) is read once per 32 weights; the units of a warp's R rows spread
+// evenly over its lanes.  The staged input is padded (33 floats per 32) so the lanes, 32 floats apart, hit distinct
+// banks.  Same fp32 arithmetic as the 8-weight kernel up to the summation order.
+__device__ __forceinline__ uint32_t gq_u16(const uint8_t* p) { return *reinterpret_cast<const uint16_t*>(p); }
+template <int T>
+__device__ __forceinline__ float gg_dot32p(const uint8_t* __restrict__ rp, int u, const float* xs, const uint32_t* grid,
+                                           const int8_t* kv) {
+    const float* x = xs + 33 * u;
+    if constexpr (T == GG_IQ3_S) {
+        const uint8_t* b = rp + (size_t) (u >> 3) * 110;
+        const int ib = u & 7;
+        const float d = __half2float(*reinterpret_cast<const __half*>(b));
+        const float db = d * (float) (1 + 2 * ((b[106 + (ib >> 1)] >> (4 * (ib & 1))) & 15));
+        const uint32_t qh = b[66 + ib];
+        const uint32_t q[4] = {gq_u16(b + 2 + 8 * ib), gq_u16(b + 4 + 8 * ib), gq_u16(b + 6 + 8 * ib), gq_u16(b + 8 + 8 * ib)};
+        const uint32_t sg = gq_u16(b + 74 + 4 * ib) | (gq_u16(b + 76 + 4 * ib) << 16);
+        float acc = 0.0f;
+#pragma unroll
+        for (int il = 0; il < 4; ++il) {
+            const uint32_t g1 = grid[(q[il] & 255) | ((qh << (8 - 2 * il)) & 256)];
+            const uint32_t g2 = grid[(q[il] >> 8) | ((qh << (7 - 2 * il)) & 256)];
+            const uint32_t sb = sg >> (8 * il);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float w1 = (float) ((g1 >> (8 * j)) & 255), w2 = (float) ((g2 >> (8 * j)) & 255);
+                acc += ((sb >> j) & 1 ? -w1 : w1) * x[8 * il + j];
+                acc += ((sb >> (4 + j)) & 1 ? -w2 : w2) * x[8 * il + 4 + j];
+            }
+        }
+        return db * acc;
+    } else if constexpr (T == GG_IQ4_NL) {
+        const uint8_t* b = rp + (size_t) u * 18;
+        const float d = __half2float(*reinterpret_cast<const __half*>(b));
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const uint32_t by = b[2 + j];
+            acc += (float) kv[by & 15] * x[j] + (float) kv[by >> 4] * x[16 + j];
+        }
+        return d * acc;
+    } else {
+        const uint8_t* b = rp + (size_t) u * 34;
+        const float d = __half2float(*reinterpret_cast<const __half*>(b));
+        float acc = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) acc += (float) (int8_t) b[2 + j] * x[j];
+        return d * acc;
+    }
+}
+template <int T, int R, bool SWI, bool PERM>
+__global__ void k_gemv_gg_sel32(const uint8_t* const* __restrict__ tab, size_t rb, const int* __restrict__ ids,
+                                const float* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K) {
+    extern __shared__ float sm[];
+    const int pad = K + K / 32;
+    float* xs = sm;
+    uint32_t* grid = reinterpret_cast<uint32_t*>(sm + pad);
+    int8_t* kv = reinterpret_cast<int8_t*>(grid + 512);
+    const float* xk = x + (size_t) blockIdx.y * x_stride;
+    for (int i = threadIdx.x; i < K; i += blockDim.x) xs[i + (i >> 5)] = SWI ? swiglu1(xk[2 * i], xk[2 * i + 1]) : xk[i];
+    gg_tables(grid, kv);
+    __syncthreads();
+    const int row0 = (blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32) * R, lane = threadIdx.x & 31;
+    if (row0 >= N) return;
+    const uint8_t* base = tab[ids[blockIdx.y]];
+    const int upr = K / 32;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int t = lane; t < R * upr; t += 32) {
+        const int r = t / upr, u = t - r * upr, o = min(row0 + r, N - 1);
+        const float v = gg_dot32p<T>(base + (size_t) (PERM ? gg_perm(o, N) : o) * rb, u, xs, grid, kv);
+#pragma unroll
+        for (int q = 0; q < R; ++q) acc[q] += q == r ? v : 0.0f;
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float s = warp_sum(acc[r]);
+        if (!lane && row0 + r < N) y[(size_t) blockIdx.y * N + row0 + r] = s;
+    }
+}
+__constant__ int c_q8w;   // INK2_Q8_WIDE (default 1): 16-byte loads in the dense Q8 GEMV (0: 8-byte)
+#define g_q8_wide (c_q8w)
 // dense Q8_0 (repacked): y[row] = W[row] . x, as gemv_bf16_dot (one warp per R rows, x staged)
 template <int R>
 __device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ Wq, const __half* __restrict__ Ws, const float* xs,
@@ -542,6 +625,27 @@ __device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ Wq, const
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    if (g_q8_wide) {   // 16 codes (one 16-byte load) per lane step, inside one 32-value scale block
+        const uint4* w16[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w16[r] = reinterpret_cast<const uint4*>(w[r]);
+#pragma unroll 2
+        for (int i = lane; i < K / 16; i += 32) {
+            uint4 v[R];
+            float f[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) { v[r] = __ldg(w16[r] + i); f[r] = __half2float(sc[r][i >> 1]); }
+            const float4 a = x4[4 * i], b = x4[4 * i + 1], c = x4[4 * i + 2], d = x4[4 * i + 3];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const char4 c0 = *reinterpret_cast<const char4*>(&v[r].x), c1 = *reinterpret_cast<const char4*>(&v[r].y);
+                const char4 c2 = *reinterpret_cast<const char4*>(&v[r].z), c3 = *reinterpret_cast<const char4*>(&v[r].w);
+                acc[r] += f[r] * (c0.x * a.x + c0.y * a.y + c0.z * a.z + c0.w * a.w + c1.x * b.x + c1.y * b.y + c1.z * b.z +
+                                  c1.w * b.w + c2.x * c.x + c2.y * c.y + c2.z * c.z + c2.w * c.w + c3.x * d.x + c3.y * d.y +
+                                  c3.z * d.z + c3.w * d.w);
+            }
+        }
+    } else
 #pragma unroll 2
     for (int i = lane; i < K / 8; i += 32) {
         uint2 v[R];
@@ -3425,8 +3529,23 @@ void gg_sel_r(int t, const uint8_t* const* tab, size_t rb, const float* x, int x
 }
 bool g_gg_q8 = false;  // INK2_GG_Q8=1: the integer (dp4a) expert GEMV (+6% decode, KL 1e-2 from the int8 inputs)
 gq8_1* g_yq = nullptr;  // decode: the experts' inputs as q8 blocks [TOPK][max(H, FF) / 32]
+template <bool SWI, bool PERM, int R>
+void gg_sel32(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs, float* y, int N, int K) {
+    const dim3 g((unsigned) ((N + 8 * R - 1) / (8 * R)), TOPK);
+    const size_t sm = (size_t) (K + K / 32 + 512 + 4) * 4;
+    switch (t) {
+    case GG_IQ3_S: k_gemv_gg_sel32<GG_IQ3_S, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K); break;
+    case GG_IQ4_NL: k_gemv_gg_sel32<GG_IQ4_NL, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K); break;
+    default: k_gemv_gg_sel32<GG_Q8_0, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K);
+    }
+}
 template <bool SWI, bool PERM>
 void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs, float* y, int N, int K) {
+    if (g_gg_rpw == 32) {   // rows x units fill the lanes: K = 2304 (72 units) R 4, K = 1152 (36 units) R 8
+        if ((K / 32) % 8 == 0) gg_sel32<SWI, PERM, 4>(t, tab, rb, x, xs, y, N, K);
+        else gg_sel32<SWI, PERM, 8>(t, tab, rb, x, xs, y, N, K);
+        return;
+    }
     if (g_gg_q8) {
         const int nb = K / 32, rows = SWI ? TOPK : 1;   // gate_up: one input for every expert
         k_quant_q8_1<SWI><<<dim3((nb + 7) / 8, rows), 256>>>(x, xs, g_yq, K);
@@ -4560,6 +4679,10 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
+    {
+        const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : 1;
+        CK(cudaMemcpyToSymbol(c_q8w, &w, sizeof(int)));
+    }
     std::string dir, dump_logits, rec_path;
     std::vector<int> ids;
     int n_gen = 32;
