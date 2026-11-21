@@ -373,7 +373,9 @@ __device__ __forceinline__ int gg_perm(int n, int N) { return (n & 1) ? N / 2 + 
 // the gate_up rows, part B: the down rows of the expert's slot); rb = bytes per row
 template <int T, int R, bool SWI, bool PERM>
 __global__ void k_gemv_gg_sel(const uint8_t* const* __restrict__ tab, size_t rb, const int* __restrict__ ids,
-                              const float* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K) {
+                              const float* __restrict__ x, int x_stride, float* __restrict__ y, int N, int K,
+                              const int* __restrict__ mflag, int mode) {
+    if (mode && (mflag[blockIdx.y] != 0) != (mode == 2)) return;   // 1: the hit experts only, 2: the missed only
     extern __shared__ float sm[];
     float* xs = sm;
     uint32_t* grid = reinterpret_cast<uint32_t*>(sm + K);
@@ -2311,6 +2313,7 @@ struct CacheArgs {
     uint8_t** fdst;
     int* nfetch;
     unsigned long long* fbytes;
+    int* mflag = nullptr;   // [n]: 1 where ids[i] missed (decode: the hit experts run while the misses are fetched)
 };
 constexpr int FETCH_MAX = 64, FETCH_BLOCKS = 96;
 __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArgs c) {
@@ -2326,6 +2329,7 @@ __global__ void k_cache_plan(int l, const int* __restrict__ ids, int n, CacheArg
             for (int j = 0; j < i; ++j) dup |= ids[j] == e;
             if (dup) continue;
             const int sl = c.slot_of[l * NE + e];
+            if (c.mflag) c.mflag[i] = sl < 0;
             if (sl >= 0) c.stamp[sl] = ++t;
             else miss[m++] = e;
         }
@@ -3245,7 +3249,11 @@ size_t kv_mapped_for(int cells) {
 // slot count is one of its launch arguments) is rebuilt at the next token.
 size_t vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); return fr; }
 size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
+extern bool g_hl;
+void hl_push();
+void hl_pull();
 void pool_resize(bool nv, int n) {
+    hl_push();   // (host-LRU decode: the device eviction works on the current residency)
     int& ns = nv ? E.nslot_nv : E.nslot_mx;
     VRange& r = nv ? E.vpool_nv : E.vpool_mx;
     const size_t eb = nv ? ex_bytes(0) : MX_BYTES;
@@ -3260,6 +3268,7 @@ void pool_resize(bool nv, int n) {
     }
     ns = n;
     if (E.exec) { CK(cudaGraphExecDestroy(E.exec)); E.exec = nullptr; }
+    if (g_hl) hl_pull();
 }
 double pool_bytes(bool nv) { return (double) (nv ? E.nslot_nv : E.nslot_mx) * (nv ? ex_bytes(0) : MX_BYTES); }
 // the pools give up `bytes`, in proportion to their sizes
@@ -3470,14 +3479,29 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
 }
 
 // offload: make layer l's experts ids[0..n) resident (plan + fetch, device side, graph-capturable)
-void expert_cache(int l, const int* ids, int n, cudaStream_t st = cudaStreamPerThread, int blocks = FETCH_BLOCKS) {
+// decode, INK2_SPLIT=1 (default, GGUF): the plan, then the misses fetched on a side stream while the hit experts run
+bool g_split = false;   // (measured slower: the SM-based fetch loses PCIe throughput beside the GEMVs)
+int g_split_blocks = 24;   // INK2_SPLIT_BLOCKS: k_fetch blocks of the side copy (SMs left to the hit experts' GEMVs)
+cudaStream_t g_sp_st = nullptr;
+cudaEvent_t g_sp_fork = nullptr, g_sp_join = nullptr;
+void expert_cache(int l, const int* ids, int n, cudaStream_t st = cudaStreamPerThread, int blocks = FETCH_BLOCKS,
+                  int* mflag = nullptr, cudaStream_t fst = nullptr) {
     const bool nv = ex_nv(l);
     CacheArgs c{E.slot_of, nv ? E.owner_nv : E.owner_mx, nv ? E.stamp_nv : E.stamp_mx, E.clock,
                 nv ? E.nslot_nv : E.nslot_mx, E.tabA, E.tabB, nv ? E.pool_nv : E.pool_mx, ex_bytes(l), ex_partA(l),
                 E.xhost_d + ex_layer_off(l), E.fsrc, E.fdst, E.nfetch, E.fbytes};
+    c.mflag = mflag;
     k_cache_plan<<<1, 1024, 0, st>>>(l, ids, n, c);
+    if (fst) {   // fetch on the side stream, after the plan; the caller joins on g_sp_join before the missed experts
+        CK(cudaEventRecord(g_sp_fork, st));
+        CK(cudaStreamWaitEvent(fst, g_sp_fork, 0));
+        k_fetch<<<dim3(blocks, std::min(n, FETCH_MAX)), 256, 0, fst>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+        CK(cudaEventRecord(g_sp_join, fst));
+        return;
+    }
     k_fetch<<<dim3(blocks, std::min(n, FETCH_MAX)), 256, 0, st>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
 }
+
 
 // Decode prefetch (offload, INK2_PREFETCH=1, default): after a layer application has routed, the next application's
 // router is applied to the same MoE input and its predicted experts are fetched on a side stream while this layer's
@@ -3517,14 +3541,16 @@ void dec_prefetch_init() {
 
 // GGUF expert GEMV launches (runtime ggml type -> kernel), INK2_GG_RPW rows per warp (2, 4, 8; default 4)
 int g_gg_rpw = 4;
+int* g_mflag = nullptr;   // decode: the plan's miss flags [TOPK]
+int g_sel_mode = 0;       // the next gg_sel launches: 0 all, 1 hit experts, 2 missed experts
 template <bool SWI, bool PERM, int R>
 void gg_sel_r(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs, float* y, int N, int K) {
     const dim3 g((unsigned) (N / (8 * R)), TOPK);
     const size_t sm = (size_t) (K + 512 + 4) * 4;
     switch (t) {
-    case GG_IQ3_S: k_gemv_gg_sel<GG_IQ3_S, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K); break;
-    case GG_IQ4_NL: k_gemv_gg_sel<GG_IQ4_NL, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K); break;
-    default: k_gemv_gg_sel<GG_Q8_0, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K);
+    case GG_IQ3_S: k_gemv_gg_sel<GG_IQ3_S, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K, g_mflag, g_sel_mode); break;
+    case GG_IQ4_NL: k_gemv_gg_sel<GG_IQ4_NL, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K, g_mflag, g_sel_mode); break;
+    default: k_gemv_gg_sel<GG_Q8_0, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K, g_mflag, g_sel_mode);
     }
 }
 bool g_gg_q8 = false;  // INK2_GG_Q8=1: the integer (dp4a) expert GEMV (+6% decode, KL 1e-2 from the int8 inputs)
@@ -3565,6 +3591,100 @@ void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs,
     }
 }
 
+// Host LRU decode (INK2_HOSTLRU=1, GGUF, one pool): the host reads each layer's routing back, picks the victims and
+// queues the misses' copies on the copy engine (DMA: no SMs), while the hit experts' GEMVs run; the missed experts run
+// after the copies.  No decode graph in this mode.  The host keeps a mirror of slot_of / owner; device-side plans (short
+// prompts) and pool resizes are pulled back (hl_pull).
+bool g_hl = true;   // INK2_HOSTLRU (default on for GGUF offload; 0: the device LRU and its decode graph)
+struct HostLru {
+    std::vector<int> slot_of, owner;
+    std::vector<uint64_t> last;
+    uint64_t tick = 0;
+    int* h_ids = nullptr;          // pinned [TOPK]
+    int* h_flag = nullptr;         // pinned ring [64][TOPK]
+    const uint8_t** h_tab = nullptr;   // pinned ring [64][4] table entries
+    cudaEvent_t ev_ring[64];
+    int ring = 0;
+    cudaStream_t cs = nullptr;
+    cudaEvent_t ev_main = nullptr, ev_copy = nullptr;
+    unsigned long long bytes = 0;
+} HL;
+void hl_pull() {   // the device's residency into the host mirror (recency: unchanged owners keep theirs)
+    std::vector<int> so((size_t) NL * NE), ow(E.nslot_nv);
+    CK(cudaMemcpy(so.data(), E.slot_of, so.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(ow.data(), E.owner_nv, ow.size() * 4, cudaMemcpyDeviceToHost));
+    HL.owner.resize(E.nslot_nv, -1);
+    HL.last.resize(E.nslot_nv, 0);
+    for (int s2 = 0; s2 < E.nslot_nv; ++s2) {
+        if (HL.owner[s2] != ow[s2]) HL.last[s2] = HL.tick;
+        HL.owner[s2] = ow[s2];
+    }
+    HL.slot_of = so;
+}
+void hl_init() {
+    CK(cudaHostAlloc((void**) &HL.h_ids, TOPK * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &HL.h_flag, 64 * TOPK * 4, cudaHostAllocDefault));
+    CK(cudaHostAlloc((void**) &HL.h_tab, 64 * 4 * sizeof(void*), cudaHostAllocDefault));
+    for (auto& e : HL.ev_ring) { CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming)); CK(cudaEventRecord(e, cudaStreamPerThread)); }
+    CK(cudaStreamCreateWithFlags(&HL.cs, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&HL.ev_main, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&HL.ev_copy, cudaEventDisableTiming));
+    hl_pull();
+}
+// layer l's routed experts resident: returns the number of misses (their copies and table entries queued on HL.cs,
+// HL.ev_copy recorded after them); the hit / miss flags are on the device in g_mflag
+int hl_plan(int l) {
+    CK(cudaMemcpyAsync(HL.h_ids, E.ids, TOPK * 4, cudaMemcpyDeviceToHost));
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    const uint64_t t = ++HL.tick;
+    const int k = HL.ring++ & 63;
+    CK(cudaEventSynchronize(HL.ev_ring[k]));
+    int* flag = HL.h_flag + k * TOPK;
+    int nm = 0, miss[TOPK];
+    for (int i = 0; i < TOPK; ++i) {
+        const int key = l * NE + HL.h_ids[i], s2 = HL.slot_of[key];
+        flag[i] = s2 < 0;
+        if (s2 >= 0) HL.last[s2] = t; else miss[nm++] = i;
+    }
+    CK(cudaMemcpyAsync(g_mflag, flag, TOPK * 4, cudaMemcpyHostToDevice));
+    CK(cudaEventRecord(HL.ev_ring[k], cudaStreamPerThread));
+    if (!nm) return 0;
+    CK(cudaEventRecord(HL.ev_main, cudaStreamPerThread));   // the victims' last readers are queued before this
+    CK(cudaStreamWaitEvent(HL.cs, HL.ev_main, 0));
+    const size_t eb = ex_bytes(l), pa = ex_partA(l);
+    for (int j = 0; j < nm; ++j) {
+        const int e = HL.h_ids[miss[j]], key = l * NE + e;
+        int v = -1;
+        for (int s2 = 0; s2 < E.nslot_nv; ++s2) {
+            if (HL.last[s2] == t) continue;
+            if (HL.owner[s2] < 0) { v = s2; break; }
+            if (v < 0 || HL.last[s2] < HL.last[v]) v = s2;
+        }
+        const int kk = HL.ring++ & 63;
+        CK(cudaEventSynchronize(HL.ev_ring[kk]));
+        const uint8_t** tb = HL.h_tab + kk * 4;
+        const int old = HL.owner[v];
+        uint8_t* d = E.pool_nv + (size_t) v * eb;
+        CK(cudaMemcpyAsync(d, E.xhost + ex_layer_off(l) + (size_t) e * eb, eb, cudaMemcpyHostToDevice, HL.cs));
+        tb[0] = d; tb[1] = d + pa; tb[2] = nullptr; tb[3] = nullptr;
+        CK(cudaMemcpyAsync(E.tabA + key, tb, sizeof(void*), cudaMemcpyHostToDevice, HL.cs));
+        CK(cudaMemcpyAsync(E.tabB + key, tb + 1, sizeof(void*), cudaMemcpyHostToDevice, HL.cs));
+        if (old >= 0) {
+            CK(cudaMemcpyAsync(E.tabA + old, tb + 2, sizeof(void*), cudaMemcpyHostToDevice, HL.cs));
+            CK(cudaMemcpyAsync(E.tabB + old, tb + 3, sizeof(void*), cudaMemcpyHostToDevice, HL.cs));
+            HL.slot_of[old] = -1;
+        }
+        CK(cudaEventRecord(HL.ev_ring[kk], HL.cs));
+        HL.owner[v] = key;
+        HL.slot_of[key] = v;
+        HL.last[v] = t;
+        HL.bytes += eb;
+    }
+    // the device's own plan state follows (slot_of / owner): a later device plan (short prompts) must agree
+    CK(cudaEventRecord(HL.ev_copy, HL.cs));
+    return nm;
+}
+
 void moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out) {
     k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
     k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
@@ -3575,7 +3695,27 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
         g_dec_pending = false;
         if (g_pred_st) k_pred_stat<<<1, 32>>>(g_dec_ids, E.ids, g_pred_st);
     }
-    if (E.xhost) expert_cache(int(&Y - E.L), E.ids, TOPK);
+    if (g_hl && E.xhost && Y.ex.gg13) {   // host LRU: DMA copies of the misses beside the hit experts' GEMVs
+        const Experts& X = Y.ex;
+        const int nm = hl_plan(int(&Y - E.L));
+        if (nm) {
+            g_sel_mode = 1;
+            gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+            gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+            CK(cudaStreamWaitEvent(cudaStreamPerThread, HL.ev_copy, 0));
+            g_sel_mode = 2;
+        }
+        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+        g_sel_mode = 0;
+        k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);
+        ++g_dec_app;
+        return;
+    }
+    const bool split = E.xhost && g_split && Y.ex.gg13 && g_sp_st && !pf && !g_gg_q8 && g_gg_rpw != 32;
+    if (split) {
+        expert_cache(int(&Y - E.L), E.ids, TOPK, cudaStreamPerThread, g_split_blocks, g_mflag, g_sp_st);
+    } else if (E.xhost) expert_cache(int(&Y - E.L), E.ids, TOPK);
     if (pf && g_dec_app + 1 < (int) g_dec_seq.size()) {   // guess the next application's experts from this input
         const Layer& Yn = E.L[g_dec_seq[g_dec_app + 1]];
         k_gemv_bf16_rowblock<<<NE, 256>>>(Yn.router.d, x, g_dec_rl, H);
@@ -3588,7 +3728,16 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     }
     ++g_dec_app;
     const Experts& X = Y.ex;
-    if (X.gg13) {
+    if (X.gg13 && split) {   // hits while the misses arrive, then the misses
+        g_sel_mode = 1;
+        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+        CK(cudaStreamWaitEvent(cudaStreamPerThread, g_sp_join, 0));
+        g_sel_mode = 2;
+        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
+        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+        g_sel_mode = 0;
+    } else if (X.gg13) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
         gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
     } else if (X.nvfp4) {
@@ -4303,7 +4452,14 @@ float* g_feat = nullptr;              // MTP: [chunk][4][H] target features of t
 int g_feat_visit[3] = {5, 23, 41};    // mtp_config target_layer_ids (the 4th, 48, is the normalized output)
 float* g_vlog = nullptr;              // verify: logits [8][VOCAB_ROWS]
 int* g_vids = nullptr;                // verify: greedy token of each position
+void hl_push() {   // the host mirror's residency into the device plan state (before a device-side plan or prompt)
+    if (!g_hl) return;
+    CK(cudaDeviceSynchronize());
+    CK(cudaMemcpy(E.slot_of, HL.slot_of.data(), HL.slot_of.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(E.owner_nv, HL.owner.data(), (size_t) E.nslot_nv * 4, cudaMemcpyHostToDevice));
+}
 void forward_prefill(const int* toks, int T, int pos0, float* all) {
+    hl_push();
     kv_fit(pos0 + T);
     pf_layout(T);   // (before the pools are read below: a growth can take slots)
     const size_t ES = (size_t) T * H;
@@ -4373,6 +4529,7 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
         }
     }
     CK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (g_hl) hl_pull();   // (short prompts plan on the device)
 }
 
 std::vector<int> parse_ids(const char* s) {
@@ -4679,6 +4836,9 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
+    if (const char* r = std::getenv("INK2_SPLIT")) g_split = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_HOSTLRU")) g_hl = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_SPLIT_BLOCKS")) g_split_blocks = std::atoi(r);
     {
         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : 1;
         CK(cudaMemcpyToSymbol(c_q8w, &w, sizeof(int)));
@@ -4765,6 +4925,19 @@ int main(int argc, char** argv) {
     }
     if (E.xhost) setup_offload();
     if (E.xhost && g_dec_prefetch) dec_prefetch_init();
+    if (E.xhost && g_split && g_is_gguf) {
+        int lo = 0, hi = 0;   // the fetch stream at the highest priority: its blocks go in ahead of the GEMVs'
+        CK(cudaDeviceGetStreamPriorityRange(&lo, &hi));
+        CK(cudaStreamCreateWithPriority(&g_sp_st, cudaStreamNonBlocking, hi));
+        CK(cudaEventCreateWithFlags(&g_sp_fork, cudaEventDisableTiming));
+        CK(cudaEventCreateWithFlags(&g_sp_join, cudaEventDisableTiming));
+        g_mflag = (int*) dalloc(FETCH_MAX * 4);
+    }
+    if (g_hl && E.xhost && g_is_gguf) {
+        if (!g_mflag) g_mflag = (int*) dalloc(FETCH_MAX * 4);
+        hl_init();
+        E.graph = false;
+    } else g_hl = false;
 
     vec logits(VOCAB);
     auto step = [&](int tok, int pos, bool want_logits) {
