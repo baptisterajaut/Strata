@@ -99,13 +99,16 @@ float dot_q8(const uint8_t* row, const float* x, int K) {
     return acc;
 }
 
+// The pool's state is one 64-bit word, generation << 32 | next index: a task is claimed by compare-and-swap only while
+// the word still carries the claimer's generation, so a worker late from the last run can never take (or skip) an
+// index of the next one, nor read its job half-written.  Jobs sit in a ring of 4 by generation.
+struct Job { void (*fn)(int, void*) = nullptr; void* ctx = nullptr; int n = 0; };
 struct Pool {
     std::vector<std::thread> th;
-    std::atomic<int> next{0}, done{0};
-    std::atomic<unsigned> gen{0};
-    int n = 0;
-    void (*fn)(int, void*) = nullptr;
-    void* ctx = nullptr;
+    std::atomic<uint64_t> state{0};
+    std::atomic<int> done{0};
+    uint32_t gen = 0;   // the host thread's
+    Job job[4];
 };
 Pool P;
 
@@ -114,26 +117,38 @@ Pool P;
 float ink2_cpu_dot(int type, const uint8_t* row, const float* x, int K) {
     return type == GG_IQ3_S ? dot_iq3s(row, x, K) : type == GG_IQ4_NL ? dot_iq4nl(row, x, K) : dot_q8(row, x, K);
 }
+static void pool_claim(uint32_t g) {   // run generation g's tasks until none is left (or g is over)
+    uint64_t v = P.state.load(std::memory_order_acquire);
+    for (;;) {
+        if ((uint32_t) (v >> 32) != g) return;
+        const Job& j = P.job[g & 3];
+        const int i = (int) (uint32_t) v;
+        if (i >= j.n) return;
+        if (P.state.compare_exchange_weak(v, v + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            j.fn(i, j.ctx);
+            P.done.fetch_add(1, std::memory_order_release);
+            v = P.state.load(std::memory_order_acquire);
+        }
+    }
+}
 void ink2_cpu_pool_start(int workers) {
     for (int w = 0; w < workers; ++w)
         P.th.emplace_back([] {
-            unsigned seen = P.gen.load();
+            uint32_t seen = (uint32_t) (P.state.load() >> 32);
             for (;;) {
-                unsigned g;
-                while ((g = P.gen.load(std::memory_order_acquire)) == seen) _mm_pause();
+                uint32_t g;
+                while ((g = (uint32_t) (P.state.load(std::memory_order_acquire) >> 32)) == seen) _mm_pause();
                 seen = g;
-                for (int i; (i = P.next.fetch_add(1)) < P.n;) { P.fn(i, P.ctx); P.done.fetch_add(1, std::memory_order_release); }
+                pool_claim(g);
             }
         });
     for (auto& t : P.th) t.detach();
 }
 void ink2_cpu_pool_run(int n, void (*fn)(int, void*), void* ctx) {
-    P.fn = fn;
-    P.ctx = ctx;
-    P.n = n;
-    P.done.store(0);
-    P.next.store(0);
-    P.gen.fetch_add(1, std::memory_order_release);
-    for (int i; (i = P.next.fetch_add(1)) < n;) { fn(i, ctx); P.done.fetch_add(1, std::memory_order_release); }
+    const uint32_t g = ++P.gen;
+    P.job[g & 3] = Job{fn, ctx, n};
+    P.done.store(0, std::memory_order_relaxed);
+    P.state.store((uint64_t) g << 32, std::memory_order_release);
+    pool_claim(g);
     while (P.done.load(std::memory_order_acquire) < n) _mm_pause();
 }

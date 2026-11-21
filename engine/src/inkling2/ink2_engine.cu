@@ -4030,13 +4030,37 @@ void forward_device() {
     }
 }
 // a decode token through the captured segments
+// INK2_SEG_TIME=1: GPU time per token in the segment graphs, the hit GEMVs and the miss rows' copies (events), the
+// rest of the token's wall time being the GPU waiting on the host
+struct SegTime { bool on = false; std::vector<cudaEvent_t> ev; double g = 0, h = 0, c = 0, wall = 0; int n = 0; } g_st;
 void forward_segments() {
     g_dec_app = 0;
-    for (size_t i = 0; i < g_seg.size(); ++i) {
+    const size_t ns = g_seg.size();
+    if (g_st.on && g_st.ev.empty()) { g_st.ev.resize(3 * ns + 2); for (auto& e : g_st.ev) CK(cudaEventCreate(&e)); }
+    const double w0 = g_st.on ? now_ms() : 0;
+    for (size_t i = 0; i < ns; ++i) {
+        if (g_st.on) CK(cudaEventRecord(g_st.ev[3 * i], cudaStreamPerThread));
         CK(cudaGraphLaunch(g_seg[i], cudaStreamPerThread));
+        if (g_st.on) CK(cudaEventRecord(g_st.ev[3 * i + 1], cudaStreamPerThread));
         moe_dyn(g_seg_args[i]);
+        if (g_st.on) CK(cudaEventRecord(g_st.ev[3 * i + 2], cudaStreamPerThread));
     }
+    if (g_st.on) CK(cudaEventRecord(g_st.ev[3 * ns], cudaStreamPerThread));
     CK(cudaGraphLaunch(g_seg_final, cudaStreamPerThread));
+    if (g_st.on) {
+        CK(cudaEventRecord(g_st.ev[3 * ns + 1], cudaStreamPerThread));
+        CK(cudaEventSynchronize(g_st.ev[3 * ns + 1]));
+        g_st.wall += now_ms() - w0;
+        float ms;
+        for (size_t i = 0; i < ns; ++i) {
+            CK(cudaEventElapsedTime(&ms, g_st.ev[3 * i], g_st.ev[3 * i + 1])); g_st.g += ms;
+            CK(cudaEventElapsedTime(&ms, g_st.ev[3 * i + 1], g_st.ev[3 * i + 2])); g_st.h += ms;
+        }
+        CK(cudaEventElapsedTime(&ms, g_st.ev[3 * ns], g_st.ev[3 * ns + 1])); g_st.c += ms;
+        if (++g_st.n % 64 == 0)
+            std::fprintf(stderr, "seg time per token (%d): wall %.2f ms, graphs %.2f, MoE part (incl. host gaps) %.2f, head %.2f\n",
+                         g_st.n, g_st.wall / g_st.n, g_st.g / g_st.n, g_st.h / g_st.n, g_st.c / g_st.n);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -4995,6 +5019,7 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_CPU_MISS")) HL.cpu = std::atoi(r) != 0;
     HL.timing = std::getenv("INK2_CPU_TIME") != nullptr;
     if (const char* r = std::getenv("INK2_SEGGRAPH")) g_seg_on = std::atoi(r) != 0;
+    g_st.on = std::getenv("INK2_SEG_TIME") != nullptr;
     if (const char* r = std::getenv("INK2_SPLIT_BLOCKS")) g_split_blocks = std::atoi(r);
     {
         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : 1;
