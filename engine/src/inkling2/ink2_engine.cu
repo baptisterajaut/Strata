@@ -3048,10 +3048,11 @@ void load_gguf() {
 // (decode graph, cuBLAS workspaces), split 80 / 20 between NVFP4 and MXFP8 bytes (two-pool LRU replay of corpus12k,
 // lru2.py: 0.20 best at 6, 7 and 8 GiB).  Initial content: looped layers first, then the others, expert order.
 // CBA: fixed 384 MiB margin and 0.20 split; per-card measurement / a routing profile if the first tokens matter.
+int g_off_margin_mib = 128;   // INK2_OFF_MARGIN_MIB: VRAM kept beside --vram-reserve-mib (the decode graph; cuBLAS is warmed up at load)
 void setup_offload() {
     size_t fr = 0, tot = 0;
     CK(cudaMemGetInfo(&fr, &tot));
-    const size_t keep = ((size_t) E.reserve_mib << 20) + (384ull << 20);
+    const size_t keep = ((size_t) E.reserve_mib << 20) + ((size_t) g_off_margin_mib << 20);
     const size_t budget = fr > keep ? fr - keep : 0;
     if (g_is_gguf) {   // one format, one pool
         E.nslot_mx = 0;
@@ -3139,7 +3140,7 @@ size_t kv_mapped_for(int cells) {
 // --kv-grow with offload: a pool's slot count changes.  Nothing may be running on the device; the decode graph (the
 // slot count is one of its launch arguments) is rebuilt at the next token.
 size_t vram_free() { size_t fr = 0, tot = 0; CK(cudaMemGetInfo(&fr, &tot)); return fr; }
-size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + (384ull << 20); }   // as setup_offload
+size_t vram_keep() { return ((size_t) std::max(E.reserve_mib, 0) << 20) + ((size_t) g_off_margin_mib << 20); }   // as setup_offload
 void pool_resize(bool nv, int n) {
     int& ns = nv ? E.nslot_nv : E.nslot_mx;
     VRange& r = nv ? E.vpool_nv : E.vpool_mx;
@@ -4529,6 +4530,7 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_PREFETCH_BLOCKS")) g_dec_pf_blocks = std::atoi(r);
     if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     if (const char* r = std::getenv("INK2_DQ_MIN")) g_dq_min = std::atoi(r);
+    if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
     std::string dir, dump_logits, rec_path;
     std::vector<int> ids;
     int n_gen = 32;
