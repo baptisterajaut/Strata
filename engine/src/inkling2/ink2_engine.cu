@@ -3671,9 +3671,11 @@ void hl_init() {
 }
 // layer l's routed experts resident: returns the number of misses (their copies and table entries queued on HL.cs,
 // HL.ev_copy recorded after them); the hit / miss flags are on the device in g_mflag
-int hl_plan(int l, const float* x = nullptr, int* mk = nullptr) {
-    CK(cudaMemcpyAsync(HL.h_ids, E.ids, TOPK * 4, cudaMemcpyDeviceToHost));
-    if (x) CK(cudaMemcpyAsync(HL.h_x, x, H * 4, cudaMemcpyDeviceToHost));
+int hl_plan(int l, const float* x = nullptr, int* mk = nullptr, bool queued = false) {
+    if (!queued) {
+        CK(cudaMemcpyAsync(HL.h_ids, E.ids, TOPK * 4, cudaMemcpyDeviceToHost));
+        if (x) CK(cudaMemcpyAsync(HL.h_x, x, H * 4, cudaMemcpyDeviceToHost));
+    }
     const double ts = HL.timing ? now_ms() : 0;
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     if (HL.timing) { HL.t_sync += now_ms() - ts; ++HL.n_layers; }
@@ -3774,6 +3776,43 @@ void hl_cpu_experts(int l, const Experts& X, const int* mk, int m) {
     if (HL.timing) { HL.t_pa += t1 - t0; HL.t_sw += t2 - t1; HL.t_pb += now_ms() - t2; }
 }
 
+// Segment graphs (host-LRU + CPU decode): each layer application's fixed part (the previous MoE combine, attention,
+// router, the routing read-back) is one CUDA graph captured on the first token; the routing-dependent part (the hit
+// experts' GEMVs, the CPU experts, their rows back) runs between them.  ~1100 of the ~1200 launches of a token become
+// 49 graph launches.  INK2_SEGGRAPH=0: plain launches.
+struct MoeArgs { const Layer* Y; const float *x, *r; float* mhist; const float* mlp_conv; float* out; };
+bool g_seg_on = true;
+bool g_seg_capture = false;
+std::vector<cudaGraphExec_t> g_seg;
+std::vector<MoeArgs> g_seg_args;
+cudaGraphExec_t g_seg_final = nullptr;
+void seg_cut() {   // end the open capture, instantiate, launch, keep
+    cudaGraph_t g;
+    CK(cudaStreamEndCapture(cudaStreamPerThread, &g));
+    cudaGraphExec_t ex;
+    CK(cudaGraphInstantiate(&ex, g, 0));
+    CK(cudaGraphDestroy(g));
+    CK(cudaGraphLaunch(ex, cudaStreamPerThread));
+    g_seg.push_back(ex);
+}
+void moe_dyn(const MoeArgs& a) {   // the routing-dependent part (the read-back already queued)
+    const Experts& X = a.Y->ex;
+    const int l = int(a.Y - E.L);
+    int mk[TOPK];
+    const int m = hl_plan(l, a.x, mk, true);
+    g_sel_mode = m ? 1 : 0;
+    gg_sel<false, true>(X.gg13, X.tA, X.rb13, a.x, 0, E.gu, 2 * FF, H);
+    gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
+    g_sel_mode = 0;
+    if (m) {
+        const double tc = HL.timing ? now_ms() : 0;
+        hl_cpu_experts(l, X, mk, m);
+        if (HL.timing) { HL.t_cpu += now_ms() - tc; ++HL.n_miss_layers; }
+        for (int j = 0; j < m; ++j)
+            CK(cudaMemcpyAsync(E.ey + (size_t) mk[j] * H, HL.h_ey + (size_t) mk[j] * H, H * 4, cudaMemcpyHostToDevice));
+    }
+}
+
 void moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out) {
     k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
     k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
@@ -3785,22 +3824,13 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
         if (g_pred_st) k_pred_stat<<<1, 32>>>(g_dec_ids, E.ids, g_pred_st);
     }
     if (g_hl && E.xhost && Y.ex.gg13 && HL.cpu) {   // host LRU, the misses on the CPU beside the GPU's hits
-        const Experts& X = Y.ex;
-        const int l = int(&Y - E.L);
-        int mk[TOPK];
-        const int m = hl_plan(l, x, mk);
-        g_sel_mode = m ? 1 : 0;
-        gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
-        gg_sel<true, false>(X.gg2, X.tB, X.rb2, E.gu, 2 * FF, E.ey, H, FF);
-        g_sel_mode = 0;
-        if (m) {
-            const double tc = HL.timing ? now_ms() : 0;
-            hl_cpu_experts(l, X, mk, m);
-            if (HL.timing) { HL.t_cpu += now_ms() - tc; ++HL.n_miss_layers; }
-            for (int j = 0; j < m; ++j)
-                CK(cudaMemcpyAsync(E.ey + (size_t) mk[j] * H, HL.h_ey + (size_t) mk[j] * H, H * 4, cudaMemcpyHostToDevice));
-        }
-        k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);
+        CK(cudaMemcpyAsync(HL.h_ids, E.ids, TOPK * 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpyAsync(HL.h_x, x, H * 4, cudaMemcpyDeviceToHost));
+        if (g_seg_capture) seg_cut();   // the fixed part up to here is one graph (launched now)
+        g_seg_args.push_back({&Y, x, r, mhist, mlp_conv, out});
+        moe_dyn(g_seg_args.back());
+        if (g_seg_capture) CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
+        k_moe_tail<<<(H + 255) / 256, 256>>>(E.ey, E.wts, mhist, mlp_conv, r, out, E.d_pos);   // (next segment)
         ++g_dec_app;
         return;
     }
@@ -3958,6 +3988,8 @@ void upload_embed(int tok) {
 // the host-side pointer swaps are the same on every call (an even number), so a replay sees the same buffers.
 void forward_device() {
     g_dec_app = 0;
+    g_seg_args.clear();
+    if (g_seg_capture) CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
     rms(E.emb_in, E.embed_norm, E.h);
     int nB = 0;
     auto run = [&](int l, int slot, const float* msgs) {
@@ -3989,6 +4021,22 @@ void forward_device() {
     gemv(E.unembed, E.mn, E.logits, VOCAB);
     k_softcap<<<(VOCAB + 255) / 256, 256>>>(E.logits, VOCAB, LOGIT_CAP);
     if (g_dec_pending) { CK(cudaStreamWaitEvent(cudaStreamPerThread, g_dec_join, 0)); g_dec_pending = false; }
+    if (g_seg_capture) {   // the last segment: the final combine, norm, output head
+        cudaGraph_t g;
+        CK(cudaStreamEndCapture(cudaStreamPerThread, &g));
+        CK(cudaGraphInstantiate(&g_seg_final, g, 0));
+        CK(cudaGraphDestroy(g));
+        CK(cudaGraphLaunch(g_seg_final, cudaStreamPerThread));
+    }
+}
+// a decode token through the captured segments
+void forward_segments() {
+    g_dec_app = 0;
+    for (size_t i = 0; i < g_seg.size(); ++i) {
+        CK(cudaGraphLaunch(g_seg[i], cudaStreamPerThread));
+        moe_dyn(g_seg_args[i]);
+    }
+    CK(cudaGraphLaunch(g_seg_final, cudaStreamPerThread));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -4946,6 +4994,7 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_HOSTLRU")) g_hl = std::atoi(r) != 0;
     if (const char* r = std::getenv("INK2_CPU_MISS")) HL.cpu = std::atoi(r) != 0;
     HL.timing = std::getenv("INK2_CPU_TIME") != nullptr;
+    if (const char* r = std::getenv("INK2_SEGGRAPH")) g_seg_on = std::atoi(r) != 0;
     if (const char* r = std::getenv("INK2_SPLIT_BLOCKS")) g_split_blocks = std::atoi(r);
     {
         const int w = std::getenv("INK2_Q8_WIDE") ? std::atoi(std::getenv("INK2_Q8_WIDE")) : 1;
@@ -5052,7 +5101,10 @@ int main(int argc, char** argv) {
         kv_fit(pos + 1);
         CK(cudaMemcpyAsync(E.d_pos, &pos, 4, cudaMemcpyHostToDevice));
         upload_embed(tok);
-        if (!E.graph) {
+        if (g_seg_on && g_hl && HL.cpu && E.xhost && g_is_gguf) {   // segment graphs (built at the first token)
+            if (!g_seg_final) { g_seg_capture = true; forward_device(); g_seg_capture = false; }
+            else forward_segments();
+        } else if (!E.graph) {
             forward_device();
         } else {
             if (!E.exec) {   // built once: every launch reads the position from E.d_pos
