@@ -410,6 +410,121 @@ __global__ void k_gemv_gg_sel(const uint8_t* const* __restrict__ tab, size_t rb,
     }
 }
 
+// ---- decode expert GEMV in integer arithmetic (INK2_GG_Q8=1, default): the activations quantized to int8 blocks of 32
+// (block_q8_1), the weights dotted 4 bytes at a time (dp4a).  The dot bodies are llama.cpp's vec_dot_iq3_s_q8_1 /
+// vec_dot_iq4_nl_q8_1 / vec_dot_q8_0_q8_1 (ggml/src/ggml-cuda/vecdotq.cuh, MIT, Copyright (c) 2023-2026 The ggml
+// authors), as vendored in src/split/src/qdot.cuh.
+struct __align__(4) gq8_1 { __half2 ds; int8_t qs[32]; };   // ds.x = d, ds.y = d * sum(qs)
+static_assert(sizeof(gq8_1) == 36, "block_q8_1");
+__constant__ __align__(16) int8_t c_iq4nl_t[16];
+__device__ __forceinline__ int gq_b2(const void* x, int i32) {
+    const uint16_t* x16 = (const uint16_t*) x;
+    return (int) ((uint32_t) x16[2 * i32] | ((uint32_t) x16[2 * i32 + 1] << 16));
+}
+__device__ __forceinline__ int2 gq_table16(int q4, const int8_t* table) {
+    const uint32_t* t32 = (const uint32_t*) table;
+    uint32_t tmp[2];
+    const uint32_t sel = 0x32103210 | (((uint32_t) q4 & 0x88888888u) >> 1);
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t sh = 16 * i;
+        const uint32_t lo = __byte_perm(t32[0], t32[1], (uint32_t) q4 >> sh), hi = __byte_perm(t32[2], t32[3], (uint32_t) q4 >> sh);
+        tmp[i] = __byte_perm(lo, hi, sel >> sh);
+    }
+    return make_int2((int) __byte_perm(tmp[0], tmp[1], 0x6420), (int) __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+// IQ3_S superblock (110 B) kbx of row bq, int offset iqs (0, 2, .., 14): 32 values against q8 block iqs / 2
+__device__ __forceinline__ float gq_dot_iq3s(const uint8_t* bq, int kbx, int iqs, const gq8_1* y, const uint32_t* grid) {
+    const uint8_t* b = bq + (size_t) kbx * 110;
+    const uint8_t *qs8 = b + 2, *qh8 = b + 66, *sg8 = b + 74, *sc8 = b + 106;
+    const int2 qsp = make_int2(gq_b2(qs8, iqs), gq_b2(qs8, iqs + 1));
+    const uint8_t* qs = (const uint8_t*) &qsp;
+    const int qh = qh8[iqs / 2];
+    const int sgp = gq_b2(sg8, iqs / 2);
+    const uint8_t* sg = (const uint8_t*) &sgp;
+    const gq8_1& q8 = y[iqs / 2];
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int g0 = (int) grid[qs[l0] | ((qh << (8 - l0)) & 0x100)];
+        const int g1 = (int) grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)];
+        const int s0 = __vcmpne4(((sg[l0 / 2] & 0x03) << 7) | ((sg[l0 / 2] & 0x0C) << 21), 0);
+        const int s1 = __vcmpne4(((sg[l0 / 2] & 0x30) << 3) | ((sg[l0 / 2] & 0xC0) << 17), 0);
+        sumi = __dp4a((int) __vsub4(g0 ^ s0, s0), *(const int*) (q8.qs + 4 * l0), sumi);
+        sumi = __dp4a((int) __vsub4(g1 ^ s1, s1), *(const int*) (q8.qs + 4 * (l0 + 1)), sumi);
+    }
+    sumi *= 1 + 2 * ((sc8[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    return __half2float(*(const __half*) b) * __low2float(q8.ds) * (float) sumi;
+}
+// IQ4_NL block (18 B) kbx, int offset iqs (0, 2): 16 values against q8 block kbx
+__device__ __forceinline__ float gq_dot_iq4nl(const uint8_t* bq, int kbx, int iqs, const gq8_1* y) {
+    const uint8_t* b = bq + (size_t) kbx * 18;
+    const gq8_1& q8 = y[kbx];
+    const int* q = (const int*) q8.qs + iqs;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) {
+        const int2 v = gq_table16(gq_b2(b + 2, iqs + l), c_iq4nl_t);
+        sumi = __dp4a((int) v.x, (int) q[l], sumi);
+        sumi = __dp4a((int) v.y, (int) q[l + 4], sumi);
+    }
+    return __half2float(*(const __half*) b) * __low2float(q8.ds) * (float) sumi;
+}
+// Q8_0 block (34 B) kbx, int offset iqs (0, 2, 4, 6): 8 values
+__device__ __forceinline__ float gq_dot_q8_0(const uint8_t* bq, int kbx, int iqs, const gq8_1* y) {
+    const uint8_t* b = bq + (size_t) kbx * 34;
+    const gq8_1& q8 = y[kbx];
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 2; ++l) sumi = __dp4a(gq_b2(b + 2, iqs + l), *(const int*) (q8.qs + 4 * (iqs + l)), sumi);
+    return __half2float(*(const __half*) b) * __low2float(q8.ds) * (float) sumi;
+}
+// x [rows][K] (row stride xs; SWI: the SwiGLU of [gate, up] pairs, stride 2K) -> q8 blocks [rows][K / 32]; a warp per block
+template <bool SWI>
+__global__ void k_quant_q8_1(const float* __restrict__ x, int xs, gq8_1* __restrict__ y, int K) {
+    const int nb = K / 32, w = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31, r = blockIdx.y;
+    if (w >= nb) return;
+    const float* xr = x + (size_t) r * xs;
+    const int i = 32 * w + lane;
+    const float v = SWI ? swiglu1(xr[2 * i], xr[2 * i + 1]) : xr[i];
+    const float am = warp_max(fabsf(v));
+    const float d = am / 127.0f;
+    const int q = am == 0.0f ? 0 : __float2int_rn(v / d);
+    const int sum = (int) warp_sum((float) q);
+    gq8_1& o = y[(size_t) r * nb + w];
+    o.qs[lane] = (int8_t) q;
+    if (!lane) o.ds = __floats2half2_rn(d, d * (float) sum);
+}
+// y[k][o] = W_e[row(o)] . x_k, the input as q8 blocks yq[k] (yq_stride blocks per expert; 0: one input for all); a warp
+// per output row, 8 rows per block of 256
+template <int T, bool PERM>
+__global__ void __launch_bounds__(256) k_gemv_gg_q8(const uint8_t* const* __restrict__ tab, size_t rb,
+                                                    const int* __restrict__ ids, const gq8_1* __restrict__ yq,
+                                                    int yq_stride, float* __restrict__ y, int N, int K) {
+    __shared__ uint32_t grid[512];   // the IQ3_S grid: scattered lookups, kept out of global memory
+    if constexpr (T == GG_IQ3_S) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) grid[i] = d_iq3s_grid[i];
+        __syncthreads();
+    }
+    const int o = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (o >= N) return;
+    const uint8_t* rp = tab[ids[blockIdx.y]] + (size_t) (PERM ? gg_perm(o, N) : o) * rb;
+    const gq8_1* yk = yq + (size_t) blockIdx.y * yq_stride;
+    float acc = 0.0f;
+    if constexpr (T == GG_IQ3_S) {   // 8 lanes per superblock (2 ints each): 4 superblocks per warp step
+        const int nsb = K / 256, iqs = 2 * (lane & 7);
+        for (int kb = lane >> 3; kb < nsb; kb += 4) acc += gq_dot_iq3s(rp, kb, iqs, yk + kb * 8, grid);
+    } else if constexpr (T == GG_IQ4_NL) {   // 2 lanes per block: 16 blocks per step
+        const int nb = K / 32, iqs = 2 * (lane & 1);
+        for (int kb = lane >> 1; kb < nb; kb += 16) acc += gq_dot_iq4nl(rp, kb, iqs, yk);
+    } else {   // Q8_0: 4 lanes per block
+        const int nb = K / 32, iqs = 2 * (lane & 3);
+        for (int kb = lane >> 2; kb < nb; kb += 8) acc += gq_dot_q8_0(rp, kb, iqs, yk);
+    }
+    acc = warp_sum(acc);
+    if (!lane) y[(size_t) blockIdx.y * N + o] = acc;
+}
+
 // dense Q8_0 (repacked): y[row] = W[row] . x, as gemv_bf16_dot (one warp per R rows, x staged)
 template <int R>
 __device__ __forceinline__ void gemv_q8_dot(const int8_t* __restrict__ Wq, const __half* __restrict__ Ws, const float* xs,
@@ -2642,6 +2757,7 @@ void load_gguf() {
     }
     CK(cudaMemcpyToSymbol(d_iq3s_grid, k_iq3s_grid, sizeof(k_iq3s_grid)));
     CK(cudaMemcpyToSymbol(c_iq4nl, k_iq4nl_values, sizeof(k_iq4nl_values)));
+    CK(cudaMemcpyToSymbol(c_iq4nl_t, k_iq4nl_values, sizeof(k_iq4nl_values)));
 }
 
 // offload: once everything else is allocated, the pools take the free VRAM minus --vram-reserve-mib and a margin
@@ -2965,13 +3081,49 @@ void attention(const Layer& Y, Slot& S, const float* xq, const float* xk, const 
 }
 
 // offload: make layer l's experts ids[0..n) resident (plan + fetch, device side, graph-capturable)
-void expert_cache(int l, const int* ids, int n) {
+void expert_cache(int l, const int* ids, int n, cudaStream_t st = cudaStreamPerThread, int blocks = FETCH_BLOCKS) {
     const bool nv = ex_nv(l);
     CacheArgs c{E.slot_of, nv ? E.owner_nv : E.owner_mx, nv ? E.stamp_nv : E.stamp_mx, E.clock,
                 nv ? E.nslot_nv : E.nslot_mx, E.tabA, E.tabB, nv ? E.pool_nv : E.pool_mx, ex_bytes(l), ex_partA(l),
                 E.xhost_d + ex_layer_off(l), E.fsrc, E.fdst, E.nfetch, E.fbytes};
-    k_cache_plan<<<1, 1024>>>(l, ids, n, c);
-    k_fetch<<<dim3(FETCH_BLOCKS, std::min(n, FETCH_MAX)), 256>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+    k_cache_plan<<<1, 1024, 0, st>>>(l, ids, n, c);
+    k_fetch<<<dim3(blocks, std::min(n, FETCH_MAX)), 256, 0, st>>>(E.fsrc, E.fdst, E.nfetch, ex_bytes(l));
+}
+
+// Decode prefetch (offload, INK2_PREFETCH=1, default): after a layer application has routed, the next application's
+// router is applied to the same MoE input and its predicted experts are fetched on a side stream while this layer's
+// experts run; the next layer waits for the side stream before its own plan.  A wrong guess costs a copy and an LRU
+// stamp, never a result: the next layer still plans and fetches exactly what it routes to.  The victims are the least
+// recently used slots, never the running layer's experts (just stamped).
+__global__ void k_pred_stat(const int* pred, const int* ids, unsigned long long* st) {
+    if (threadIdx.x) return;
+    int m = 0;
+    for (int i = 0; i < TOPK; ++i) for (int j = 0; j < TOPK; ++j) m += pred[i] == ids[j];
+    atomicAdd(st, (unsigned long long) m);
+    atomicAdd(st + 1, (unsigned long long) TOPK);
+}
+unsigned long long* g_pred_st = nullptr;   // INK2_PREFETCH_STAT=1: [matched, predicted]
+bool g_dec_prefetch = false;   // INK2_PREFETCH=1: measured slower on PCIe 3.0 x8 (the link is the bottleneck)
+int g_dec_pf_blocks = 32;          // INK2_PREFETCH_BLOCKS: k_fetch blocks of the side copy (SMs left to the compute)
+cudaStream_t g_dec_ps = nullptr;
+cudaEvent_t g_dec_fork = nullptr, g_dec_join = nullptr;
+bool g_dec_pending = false;
+int g_dec_app = 0;
+std::vector<int> g_dec_seq;        // the layer of each application, in order
+float* g_dec_rl = nullptr;         // [NE] predicted router logits
+int* g_dec_ids = nullptr;          // [TOPK]
+float* g_dec_wts = nullptr;
+void dec_prefetch_init() {
+    for (int l = 0; l < LOOP_END; ++l) g_dec_seq.push_back(l);
+    for (int p = 1; p < PASSES; ++p) for (int l = LOOP_BEGIN; l < LOOP_END; ++l) g_dec_seq.push_back(l);
+    for (int l = LOOP_END; l < NL; ++l) g_dec_seq.push_back(l);
+    CK(cudaStreamCreateWithFlags(&g_dec_ps, cudaStreamNonBlocking));
+    CK(cudaEventCreateWithFlags(&g_dec_fork, cudaEventDisableTiming));
+    CK(cudaEventCreateWithFlags(&g_dec_join, cudaEventDisableTiming));
+    g_dec_rl = dfloats(NE);
+    g_dec_wts = dfloats(TOPK);
+    g_dec_ids = (int*) dalloc(TOPK * 4);
+    if (std::getenv("INK2_PREFETCH_STAT")) g_pred_st = (unsigned long long*) dalloc(16);
 }
 
 // GGUF expert GEMV launches (runtime ggml type -> kernel), INK2_GG_RPW rows per warp (2, 4, 8; default 4)
@@ -2986,8 +3138,22 @@ void gg_sel_r(int t, const uint8_t* const* tab, size_t rb, const float* x, int x
     default: k_gemv_gg_sel<GG_Q8_0, R, SWI, PERM><<<g, 256, sm>>>(tab, rb, E.ids, x, xs, y, N, K);
     }
 }
+bool g_gg_q8 = false;  // INK2_GG_Q8=1: the integer (dp4a) expert GEMV (+6% decode, KL 1e-2 from the int8 inputs)
+gq8_1* g_yq = nullptr;  // decode: the experts' inputs as q8 blocks [TOPK][max(H, FF) / 32]
 template <bool SWI, bool PERM>
 void gg_sel(int t, const uint8_t* const* tab, size_t rb, const float* x, int xs, float* y, int N, int K) {
+    if (g_gg_q8) {
+        const int nb = K / 32, rows = SWI ? TOPK : 1;   // gate_up: one input for every expert
+        k_quant_q8_1<SWI><<<dim3((nb + 7) / 8, rows), 256>>>(x, xs, g_yq, K);
+        const dim3 g((unsigned) ((N + 7) / 8), TOPK);
+        const int st = SWI ? nb : 0;
+        switch (t) {
+        case GG_IQ3_S: k_gemv_gg_q8<GG_IQ3_S, PERM><<<g, 256>>>(tab, rb, E.ids, g_yq, st, y, N, K); break;
+        case GG_IQ4_NL: k_gemv_gg_q8<GG_IQ4_NL, PERM><<<g, 256>>>(tab, rb, E.ids, g_yq, st, y, N, K); break;
+        default: k_gemv_gg_q8<GG_Q8_0, PERM><<<g, 256>>>(tab, rb, E.ids, g_yq, st, y, N, K);
+        }
+        return;
+    }
     switch (g_gg_rpw) {
     case 2: gg_sel_r<SWI, PERM, 2>(t, tab, rb, x, xs, y, N, K); break;
     case 8: gg_sel_r<SWI, PERM, 8>(t, tab, rb, x, xs, y, N, K); break;
@@ -2999,7 +3165,24 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
     k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
+    const bool pf = E.xhost && g_dec_prefetch && !g_dec_seq.empty();
+    if (pf && g_dec_pending) {
+        CK(cudaStreamWaitEvent(cudaStreamPerThread, g_dec_join, 0));
+        g_dec_pending = false;
+        if (g_pred_st) k_pred_stat<<<1, 32>>>(g_dec_ids, E.ids, g_pred_st);
+    }
     if (E.xhost) expert_cache(int(&Y - E.L), E.ids, TOPK);
+    if (pf && g_dec_app + 1 < (int) g_dec_seq.size()) {   // guess the next application's experts from this input
+        const Layer& Yn = E.L[g_dec_seq[g_dec_app + 1]];
+        k_gemv_bf16_rowblock<<<NE, 256>>>(Yn.router.d, x, g_dec_rl, H);
+        k_router<<<1, NE>>>(g_dec_rl, Yn.router_bias, g_dec_ids, g_dec_wts);
+        CK(cudaEventRecord(g_dec_fork, cudaStreamPerThread));
+        CK(cudaStreamWaitEvent(g_dec_ps, g_dec_fork, 0));
+        expert_cache(g_dec_seq[g_dec_app + 1], g_dec_ids, TOPK, g_dec_ps, g_dec_pf_blocks);
+        CK(cudaEventRecord(g_dec_join, g_dec_ps));
+        g_dec_pending = true;
+    }
+    ++g_dec_app;
     const Experts& X = Y.ex;
     if (X.gg13) {
         gg_sel<false, true>(X.gg13, X.tA, X.rb13, x, 0, E.gu, 2 * FF, H);
@@ -3112,6 +3295,7 @@ void upload_embed(int tok) {
 // one token: embedding in E.emb_in, position in E.d_pos; writes E.logits.  Device work only (captured in a graph):
 // the host-side pointer swaps are the same on every call (an even number), so a replay sees the same buffers.
 void forward_device() {
+    g_dec_app = 0;
     rms(E.emb_in, E.embed_norm, E.h);
     int nB = 0;
     auto run = [&](int l, int slot, const float* msgs) {
@@ -3142,6 +3326,7 @@ void forward_device() {
     attnres(E.Bbuf, nB + 1, E.final_query, 1, nullptr, E.norm, nullptr, nullptr, E.mn);
     gemv(E.unembed, E.mn, E.logits, VOCAB);
     k_softcap<<<(VOCAB + 255) / 256, 256>>>(E.logits, VOCAB, LOGIT_CAP);
+    if (g_dec_pending) { CK(cudaStreamWaitEvent(cudaStreamPerThread, g_dec_join, 0)); g_dec_pending = false; }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -3175,11 +3360,14 @@ Prefill PF;
 
 // Elastic prompt buffers (--kv-grow with offload): the chunk-sized buffers over 8 MiB and the staging halves live in
 // growable ranges, mapped while a prompt is read (memory taken from the expert pools) and unmapped after.
+bool g_pf_routed = false;   // this chunk runs through the decode cache (short chunks): no streaming
+int g_pf_routed_max = 64;   // INK2_ROUTED_MAX: chunks of up to this many tokens fetch only the experts they route to
 bool g_pf_elastic = false;
 std::vector<VRange> g_pfr;
-std::vector<bool> g_pfr_whole;   // parts at offsets of the full --chunk (the region, the fp16 input thirds, staging)
+std::vector<int> g_pfr_whole;    // 1: parts at offsets of the full --chunk (the region, the fp16 input thirds), mapped
+                                 // whole; 2: the staging halves (whole, and not at all for a routed short prompt)
 int g_pf_mapped_T = 0;
-void* pf_alloc(size_t bytes, bool whole = false) {
+void* pf_alloc(size_t bytes, int whole = 0) {
     if (!g_pf_elastic || bytes < ((size_t) 8 << 20)) return dalloc(bytes);
     g_pfr.emplace_back();
     g_pfr.back().init(bytes);
@@ -3228,7 +3416,7 @@ void alloc_prefill() {
         for (int h = 0; h < 2; ++h) {
             CK(cudaEventCreateWithFlags(&PF.ev_free[h], cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&PF.ev_ready[h], cudaEventDisableTiming));
-            PF.stg[h] = (uint8_t*) pf_alloc(PF.stg_half, true);
+            PF.stg[h] = (uint8_t*) pf_alloc(PF.stg_half, 2);
             CK(cudaHostAlloc((void**) &PF.ptab[h], NE * sizeof(void*), cudaHostAllocDefault));
             PF.dtab[h] = (const uint8_t**) dalloc(NE * sizeof(void*));
         }
@@ -3268,7 +3456,8 @@ void pf_map(int T) {
     std::vector<size_t> want(g_pfr.size());
     for (size_t i = 0; i < g_pfr.size(); ++i) {
         const VRange& r = g_pfr[i];
-        want[i] = g_pfr_whole[i] ? r.reserved : r.need(std::min(r.reserved, (size_t) ((double) r.reserved * (T + 64) / PF.TP)));
+        want[i] = g_pfr_whole[i] == 2 ? (T <= g_pf_routed_max ? 0 : r.reserved)
+                : g_pfr_whole[i] ? r.reserved : r.need(std::min(r.reserved, (size_t) ((double) r.reserved * (T + 64) / PF.TP)));
         if (want[i] > r.mapped) add += want[i] - r.mapped;
     }
     const size_t keep = vram_keep(), fr = vram_free();
@@ -3395,7 +3584,7 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
 template <class F> void expert_parts(int l, bool partB, F launch) {
     const Experts& X = E.L[l].ex;
     launch(partB ? X.tB : X.tA);
-    if (!E.xhost) return;
+    if (!E.xhost || g_pf_routed) return;
     const auto& nonres = PF.nonres[l];
     const size_t eb = ex_bytes(l), part = partB ? eb - ex_partA(l) : ex_partA(l), off = partB ? ex_partA(l) : 0;
     const int per = (int) (PF.stg_half / part);
@@ -3455,6 +3644,11 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
     kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt);
     const Experts& X = Y.ex;
     const int l = int(&Y - E.L), nr = T * TOPK, maxt = nr / FM + NE;
+    // A short chunk uses few experts: it makes the ones it routes to resident through the decode cache (groups of 8
+    // tokens: at most 64 misses per plan) instead of streaming every expert the pools do not hold.
+    g_pf_routed = E.xhost && T <= g_pf_routed_max;
+    if (g_pf_routed)
+        for (int t0 = 0; t0 < T; t0 += 8) expert_cache(l, PF.ids + (size_t) t0 * TOPK, std::min(8, T - t0) * TOPK);
     if (X.gg13) {   // GGUF experts: the same streaming of part A (gate_up) then part B (down)
         half* ah = reinterpret_cast<half*>(PF.act);
         const int mt = PF.tc ? nr / TM + NE : maxt;
@@ -3679,6 +3873,10 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_SEL_RPW")) g_sel_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_GEMV_MINB")) g_gemv_min_blocks = std::atoi(r);
     if (const char* r = std::getenv("INK2_GG_RPW")) g_gg_rpw = std::atoi(r);
+    if (const char* r = std::getenv("INK2_GG_Q8")) g_gg_q8 = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_PREFETCH")) g_dec_prefetch = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_PREFETCH_BLOCKS")) g_dec_pf_blocks = std::atoi(r);
+    if (const char* r = std::getenv("INK2_ROUTED_MAX")) g_pf_routed_max = std::atoi(r);
     std::string dir, dump_logits, rec_path;
     std::vector<int> ids;
     int n_gen = 32;
@@ -3742,6 +3940,7 @@ int main(int argc, char** argv) {
     else load();
     if (PF.TP > 0) PF_RING_EXTRA = PF.TP;
     alloc_state();
+    if (g_is_gguf) g_yq = (gq8_1*) dalloc((size_t) TOPK * (std::max(H, FF) / 32) * sizeof(gq8_1));   // (not inside a capture)
     if (PF.TP > 0) alloc_prefill();
     const size_t rec_n = (size_t) NCALLS * E.ctx * TOPK;
     if (E.rec_mode) E.rec = (int*) dalloc(rec_n * 4);
@@ -3753,6 +3952,7 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(E.rec, r.data(), rec_n * 4, cudaMemcpyHostToDevice));
     }
     if (E.xhost) setup_offload();
+    if (E.xhost && g_dec_prefetch) dec_prefetch_init();
 
     vec logits(VOCAB);
     auto step = [&](int tok, int pos, bool want_logits) {
@@ -3924,6 +4124,11 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(&fb2, E.fbytes, 8, cudaMemcpyDeviceToHost));
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
+        if (g_pred_st) {
+            unsigned long long st[2];
+            CK(cudaMemcpy(st, g_pred_st, 16, cudaMemcpyDeviceToHost));
+            std::printf("\nprefetch guesses: %.1f%% of the next layer's experts\n", st[1] ? 100.0 * st[0] / st[1] : 0.0);
+        }
         std::printf("\nexpert fetch: prompt %.1f MB/token, decode %.1f MB/token; VRAM used %.2f GiB of %.2f\n",
                     (fb1 + PF.fbytes) / 1e6 / std::max<size_t>(1, ids.size()), (fb2 - fb1) / 1e6 / std::max(1, n_gen),
                     (tot - fr) / 1073741824.0, tot / 1073741824.0);
