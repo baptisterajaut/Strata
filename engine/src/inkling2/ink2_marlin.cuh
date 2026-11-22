@@ -21,26 +21,26 @@ struct MarlinState {
     half *dx = nullptr, *dgu = nullptr, *dact = nullptr, *dey = nullptr;   // decode fp16 scratch
     const float* gs13[NL] = {};
     const float* gs2[NL] = {};
-    uint8_t* stage = nullptr;   // load: one layer in the checkpoint layout
 };
 MarlinState MS;
 
 // a layer's experts, checkpoint layout on the host -> Marlin layout in its pool range
 void marlin_load_layer(const uint8_t* lay, size_t bytes, uint8_t* dst) {
-    if (!MS.stage) CK(cudaMalloc(&MS.stage, (size_t) NE * NV_BYTES));
-    CK(cudaMemcpy(MS.stage, lay, bytes, cudaMemcpyHostToDevice));
+    uint8_t* stage = nullptr;   // the layer in the checkpoint layout, for the time of the repack (573 MB)
+    CK(cudaMalloc(&stage, (size_t) NE * NV_BYTES));
+    CK(cudaMemcpy(stage, lay, bytes, cudaMemcpyHostToDevice));
     for (int e = 0; e < NE; ++e) {
         const size_t o = (size_t) e * NV_BYTES;
-        ink_marlin::repack_part(MS.stage + o, dst + o, 2 * FF, H, cudaStreamPerThread);
-        ink_marlin::repack_part(MS.stage + o + NV_A, dst + o + NV_A, H, FF, cudaStreamPerThread);
+        ink_marlin::repack_part(stage + o, dst + o, 2 * FF, H, cudaStreamPerThread);
+        ink_marlin::repack_part(stage + o + NV_A, dst + o + NV_A, H, FF, cudaStreamPerThread);
     }
     CK(cudaStreamSynchronize(cudaStreamPerThread));
+    CK(cudaFree(stage));
 }
 
 int marlin_block(int T) { return T <= SMALL_T ? 8 : T <= 256 ? 16 : T < 2048 ? 32 : 64; }   // 3090 bench (mbench)
 
 void marlin_alloc() {
-    if (MS.stage) { CK(cudaFree(MS.stage)); MS.stage = nullptr; }
     for (int l = 0; l < MXFP8_FIRST; ++l) {
         vec a(NE), b(NE);
         for (int e = 0; e < NE; ++e) {
