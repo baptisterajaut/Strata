@@ -96,6 +96,25 @@ which is why the 16 GB card at 128K stays without the drafter.
   check without, 32.6 with. With the expert routing fixed, the 8-token prompt lane is at mean KL 3.0e-7 against the
   fp32 token path, against 8.7e-8 without the flag, top-1 100%.
 
+- `--marlin 1` (off by default) keeps the NVFP4 experts (layers 0-19) in the Marlin layout and multiplies them with
+  the Marlin MoE kernels vendored from vLLM (`engine/src/inkling2/third_party/marlin`, Apache-2.0): fp16 activations
+  and products, fp32 accumulation, for prompts, `--spec` checks and plain decoding alike. It needs the checkpoint,
+  every expert on the card (no `--vram-reserve-mib`) and an NVIDIA card of the RTX 30 series or newer; elsewhere the
+  engine says so and runs as without it. The MXFP8 experts (layers 20-23) keep their kernels. RTX 3090, every expert
+  on the card, two runs each:
+
+  | | Without | `--marlin 1` |
+  | --- | --- | --- |
+  | 16K-token prompt, `--chunk` 512 / 1024 / 2048 | 1,900 / 2,450 / 2,830 tok/s | 2,910 / 3,360 / 3,670 tok/s |
+  | 1K-token prompt | 2,510 tok/s | 3,450 tok/s |
+  | Decode, chat prompt (257 tokens) | 91.0, with `--spec 1` 88.6 | 89.8, with `--spec 1` 94-95 |
+  | Decode, short prompt (24 tokens) | 92.5, with `--spec 1` 108.8 | 91.2, with `--spec 1` 127.3 |
+
+  A prompt chunk's expert products run twice as fast at `--chunk 2048` (3.4 to 1.7 ms per launch) and a `--spec`
+  check's about twice (estimated from the kernel totals); one token at a time the two kernels are level, both read
+  the eight experts at about two thirds of the card's memory bandwidth, and decoding is 1% slower. Loading takes
+  about 550 MiB more VRAM while a layer is repacked, and 21 MiB after. Quality is in [Quality](#quality).
+
 **Conversations and pictures**
 
 - `--conversation-cache-mib N` (0, off, by default) keeps conversations in pinned RAM so that a request never reads
@@ -126,9 +145,48 @@ Against the transformers implementation in fp32 on a 1,600-token text: the token
 mean KL 1.4e-12 (top-1 100%), and the tensor-core prompt path at 2.1e-7 with the expert routing fixed. Pictures: mean
 KL 1e-7 or less in fp32, with the same greedy answers.
 
+With `--marlin 1` (fp16 expert products) and the expert routing fixed, the prompt path is at mean KL 3.4e-7 against
+the fp32 token-by-token path (1.3e-7 without the flag, same run) and a `--spec` check block at 1.0e-7 (8.7e-8), top-1
+100% in each case. With free routing and fp16 K/V, against the transformers fp32 reference: token-by-token 1.41e-3 and
+top-1 98.37% (1.32e-3, 98.44% without the flag), prompt path 1.15e-3 and 98.37% (1.03e-3, 98.31%); those figures move
+with single routing flips, not with the kernels. As without the flag, a `--spec 1` answer can part from the plain one
+at a near-tie (512 greedy tokens: the same for 181 and 316 tokens on two prompts; 273 without the flag).
+
+## Compared with vLLM
+
+vLLM 0.34.0rc1.dev1145+g0e3c8dbda (the nightly wheel of 2026-11-22), same RTX 3090, same checkpoint. That build asks
+for compute capability 9.0; it ran on the 3090 after four local changes: the capability gate lowered, FlashAttention 2
+for the vision tower, programmatic dependent launch turned off in Triton, and the Triton fallback instead of the
+native conv/mix kernel. It keeps bf16 K/V and its expert products come from the Humming kernels with bf16
+activations (not from Marlin). With 18.2 GiB of weights it could not hold a 16K-token context in 24 GB (it asked for
+4.4 GiB of K/V and had 1.6 to 2.2), so it was measured at `--max-model-len 1536` (680 with DSpark), batch 1, greedy:
+
+| | vLLM | strata-ink2 | with `--marlin 1` |
+| --- | --- | --- | --- |
+| Decode, chat prompt (257 tokens) | 93.6 tok/s | 91.0 | 89.8 |
+| the same with the drafter (DSpark, 7 drafts; ours `--spec 1`) | 126.1 (400 tokens) | 88.6 | 94-95 |
+| Decode, short prompt (24 tokens) | 94.1 | 92.5 | 91.2 |
+| the same with the drafter | 221.6 | 108.8 | 127.3 |
+| 1K-token prompt | 4,700 to 5,240 tok/s | 2,510 | 3,450 |
+
+A public card (localmaxxing.com: vLLM v0.1.dev25855+g7cb5dae22, RTX 3090, 65,536-token context, 22.9 GB) reports
+5,245 tok/s on a 16,384-token prompt and 242 tok/s with DSpark. That commit is not in the vLLM repository and the
+build above could not run that shape, so it is not reproduced here. On it (16,384 tokens in, 1,174 out,
+`--max-context 65536 --chunk 2048`) strata-ink2 reads the prompt at 2,830 tok/s and writes 84.8 tok/s (100.8 with
+`--spec 1`); with `--marlin 1`, 3,680 tok/s and 83.9 tok/s (109 to 114 with `--spec 1`).
+
+Where the difference is. One token at a time the engines are level: both are bound by reading eight experts per layer
+pass. With the drafter, vLLM spends 17 to 21 ms on a step (seven drafts and the check of eight positions) and keeps
+2.7 to 3.9 tokens of it; strata-ink2 keeps 3 to 5 but spends about 36 ms (30 with `--marlin 1`), of which 12 ms are
+the attention and output projections read once per position group, so it often goes back to plain decoding. On
+prompts, after `--marlin 1` the expert products are a quarter of the GPU time at 16K and the attention kernel another
+quarter.
+
 ## Limits
 
 - One GPU. `--cpu-threads` on Linux only, at most two NUMA nodes.
 - `--spec` with the expert offload and no `--cpu-threads` copies a check's missing experts over PCIe: 16 tok/s on an
   8 GB card. Setup does not write that pair.
+- `--marlin 1` only with every expert on the card: with the expert offload or a GGUF file the flag is ignored, and
+  setup does not write it.
 - Not offered in `strata launch` or the desktop app yet.
