@@ -583,6 +583,21 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       set_target_properties(strata-ink2ref strata-ink2 PROPERTIES EXCLUDE_FROM_ALL ON)
     endif()
+    # --marlin 1: the vendored Marlin MoE kernels (src/inkling2/third_party/marlin: vLLM, Apache-2.0), CUDA only.
+    # Their two flags stay on these translation units.
+    if(STRATA_ENABLE_CUDA)
+      set(_ink2_marlin_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/inkling2/third_party/marlin)
+      add_library(strata_ink2_marlin STATIC
+        ${_ink2_marlin_dir}/ink_marlin.cu
+        ${_ink2_marlin_dir}/moe/sm80_kernel_float16_fe2m1f_float16.cu)
+      target_include_directories(strata_ink2_marlin PRIVATE ${_ink2_marlin_dir} ${_ink2_marlin_dir}/moe)
+      target_compile_definitions(strata_ink2_marlin PRIVATE MARLIN_NAMESPACE_NAME=marlin_moe_wna16)
+      target_compile_options(strata_ink2_marlin PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -static-global-template-stub=false>)
+      set_target_properties(strata_ink2_marlin PROPERTIES EXCLUDE_FROM_ALL ON)
+      target_link_libraries(strata-ink2 PRIVATE strata_ink2_marlin)
+      target_compile_definitions(strata-ink2 PRIVATE STRATA_INK2_MARLIN=1)
+    endif()
   endif()
   # the engine path for the same family (serve protocol, prompt chunks, decode graph): src/qwen35/q36_engine.cu, a
   # library that `strata` switches to for a qwen35moe model (the family switch at the top of its main) and that

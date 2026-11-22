@@ -25,6 +25,9 @@
 #include "ink2_cpu.hpp"
 #include "ink2_iq_tables.h"
 #include "ink2_image.hpp"
+#if !defined(STRATA_USE_HIP) && defined(STRATA_INK2_MARLIN)
+#include "third_party/marlin/ink_marlin.h"   // --marlin 1 (ink2_marlin.cuh)
+#endif
 
 #if !defined(STRATA_USE_HIP)
 #include <cuda.h>
@@ -2688,6 +2691,11 @@ size_t ex_layer_off(int l) {   // offset of layer l's first expert in the reside
 }
 size_t pool_slot(bool nv) { return ex_bytes(nv ? 0 : NL - 1); }   // bytes of a pool_nv / pool_mx slot (offload)
 int g_slot = 0;   // the layer application being built (host side, baked into the launches)
+// --marlin 1 (ink2_marlin.cuh): the NVFP4 experts in the Marlin layout, their products by the vendored Marlin kernels
+bool g_marlin = false;
+void marlin_load_layer(const uint8_t* lay, size_t bytes, uint8_t* dst);
+void marlin_moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out);
+void marlin_moe_b(const Layer& Y, const float* x, float* out, int T);
 bool g_verify_tc = false;   // --verify-tc 1: small-T dense products on tensor cores (k_gemv_bf16_tc)
 int g_rpw = 4;    // decode GEMV rows per warp, upper bound (INK2_RPW: 1, 2, 4, 8)
 int g_sel_rpw = 2;   // expert (selected) GEMV rows per warp (INK2_SEL_RPW: 1, 2, 4, 8)
@@ -2874,7 +2882,8 @@ void load() {
             }
             if (!E.offload) {   // resident: the layer's range of its pool (offload: setup_offload fills the pools)
                 uint8_t* dst = (X.nvfp4 ? E.pool_nv : E.pool_mx) + ex_layer_off(l) - (X.nvfp4 ? 0 : ex_layer_off(MXFP8_FIRST));
-                CK(cudaMemcpy(dst, lay.data(), lay.size(), cudaMemcpyHostToDevice));
+                if (g_marlin && X.nvfp4) marlin_load_layer(lay.data(), lay.size(), dst);
+                else CK(cudaMemcpy(dst, lay.data(), lay.size(), cudaMemcpyHostToDevice));
                 for (int e = 0; e < NE; ++e) {
                     E.htabA[l * NE + e] = dst + (size_t) e * eb;
                     E.htabB[l * NE + e] = dst + (size_t) e * eb + ex_partA(l);
@@ -4036,6 +4045,7 @@ void moe(const Layer& Y, const float* x, const float* r, float* mhist, const flo
     k_gemv_bf16_rowblock<<<NE, 256>>>(Y.router.d, x, E.rl, H);
     k_router<<<1, NE>>>(E.rl, Y.router_bias, E.ids, E.wts);
     if (E.rec_mode == 1) k_rec_ids<<<1, TOPK>>>(E.ids, E.rec + (size_t) g_slot * E.ctx * TOPK, E.d_pos);
+    if (g_marlin && Y.ex.nvfp4) { marlin_moe(Y, x, r, mhist, mlp_conv, out); return; }
     if (E.cpu) expert_cpu_ring(int(&Y - E.L), x);
     else if (E.offload) expert_cache(int(&Y - E.L), E.ids, TOPK);
     const Experts& X = Y.ex;
@@ -4267,6 +4277,8 @@ void pf_layout(int T) {
     PF.gu = g_region; PF.ey = g_region; PF.act = g_region + (size_t) T * TOPK * 2 * FF;
     PF.lg = g_region;
 }
+
+#include "ink2_marlin.cuh"   // --marlin 1: the NVFP4 expert products by the vendored Marlin kernels
 
 void alloc_prefill() {
     g_pfr.reserve(64);
@@ -4633,6 +4645,7 @@ void moe_b(const Layer& Y, const float* x, float* out, int T, int pos0) {
         k_router<<<T, NE>>>(PF.rl, Y.router_bias, PF.ids, PF.wts);
     kb_moe_plan<<<1, 1024>>>(PF.ids, T, PF.rows, PF.slot, PF.tile_e, PF.tile_r0, PF.ntiles, PF.eoff, PF.ecnt);
     const Experts& X = Y.ex;
+    if (g_marlin && X.nvfp4) { marlin_moe_b(Y, x, out, T); return; }
     const int l = int(&Y - E.L), nr = T * TOPK, maxt = nr / FM + NE;
     // A short chunk uses few experts: it makes the ones it routes to resident through the decode cache (groups of 8
     // tokens: at most 64 misses per plan) instead of streaming every expert the pools do not hold.
@@ -5527,6 +5540,7 @@ int main(int argc, char** argv) {
         else if (a == "--graph") E.graph = std::atoi(v) != 0;
         else if (a == "--chunk") PF.TP = std::atoi(v);
         else if (a == "--tc") PF.tc = std::atoi(v) != 0;
+        else if (a == "--marlin") g_marlin = std::atoi(v) != 0;
         else if (a == "--verify-tc") g_verify_tc = std::atoi(v) != 0;
         else if (a == "--vram-reserve-mib") E.reserve_mib = std::atoi(v);
         else if (a == "--spec") spec = std::atoi(v) != 0;
@@ -5558,7 +5572,7 @@ int main(int argc, char** argv) {
     if (E.grow) vmm_init();
     if (dir.empty() || (ids.empty() && !serve && vis_pixels.empty())) {
         std::fprintf(stderr, "usage: strata-ink2 --model DIR (--serve | --tokens IDS | --tokens-file F) [--n N] [--ctx N] "
-                             "[--chunk N] [--tc 0|1] [--verify-tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
+                             "[--chunk N] [--tc 0|1] [--marlin 0|1] [--verify-tc 0|1] [--kv f16|fp16|f32|i8|int8|i8r|k8v4|k8v8] [--kv-grow 1 [--kv-grow-step N]] [--vram-reserve-mib N [--cpu-threads N]] [--spec 0|1] [--dump-logits F] [--conversation-cache-mib N [--conversation-cache-min-tokens N]] [--image FILE ... [--image-max-tokens N] [--dump-image-emb F]] [--vis-pixels F]\n");
         return 2;
     }
     if (serve && PF.TP <= 0) { std::fprintf(stderr, "--serve needs --chunk > 0\n"); return 2; }
@@ -5575,6 +5589,16 @@ int main(int argc, char** argv) {
     // until IQ3_S / IQ4_NL / Q8_0 CPU dots and a GGUF drafter exist
     if (g_is_gguf && E.cpu) { std::fprintf(stderr, "--cpu-threads: not with a GGUF model (no GGUF CPU expert kernels yet)\n"); return 2; }
     if (g_is_gguf && spec) { std::fprintf(stderr, "--spec: not with a GGUF model (no drafter for it yet)\n"); return 2; }
+    if (g_marlin) {   // CBA (ink2_marlin.cuh): resident checkpoint experts on an Ampere or later NVIDIA card only
+        int cc = 0;
+#if !defined(STRATA_USE_HIP) && defined(STRATA_INK2_MARLIN)
+        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, 0);
+#endif
+        if (g_is_gguf || E.reserve_mib >= 0 || cc < 8) {
+            std::fprintf(stderr, "[ink2] --marlin 1 ignored: it needs the checkpoint, every expert on the card (no --vram-reserve-mib) and a CUDA card of compute capability 8.0 or later\n");
+            g_marlin = false;
+        }
+    }
     if (g_verify_tc) {   // mma m16n8k16 f16: CUDA sm_80+
         int cc = 0;
 #if !defined(STRATA_USE_HIP)
@@ -5602,6 +5626,7 @@ int main(int argc, char** argv) {
     // a per-verify map / unmap would cost two device syncs per block
     g_pf_elastic = E.grow && E.offload && !spec;
     if (PF.TP > 0) alloc_prefill();
+    if (g_marlin) marlin_alloc();
     const size_t rec_n = (size_t) NCALLS * E.ctx * TOPK;
     if (E.rec_mode) E.rec = (int*) dalloc(rec_n * 4);
     if (E.rec_mode == 2) {
