@@ -99,8 +99,11 @@ which is why the 16 GB card at 128K stays without the drafter.
 - `--marlin 1` (off by default) keeps the NVFP4 experts (layers 0-19) in the Marlin layout and multiplies them with
   the Marlin MoE kernels vendored from vLLM (`engine/src/inkling2/third_party/marlin`, Apache-2.0): fp16 activations
   and products, fp32 accumulation, for prompts, `--spec` checks and plain decoding alike. It needs the checkpoint,
-  every expert on the card (no `--vram-reserve-mib`) and an NVIDIA card of compute capability 8.0 or later (run on an
-  RTX 3090 only; the other architectures were compiled, not run); elsewhere the engine says so and runs as without it. The MXFP8 experts (layers 20-23) keep their kernels. RTX 3090, every expert
+  every NVFP4 expert on the card, no `--kv-grow` and an NVIDIA card of compute capability 8.0 or later (run on an
+  RTX 3090 only; the other architectures were compiled, not run); elsewhere the engine says so and runs as without it.
+  With `--vram-reserve-mib`, the flag sizes the NVFP4 pool first, for all 2,560 NVFP4 experts (10.7 GiB), and the MXFP8
+  pool takes the rest: a 24 GB card at 256K with `--kv i8r` keeps every NVFP4 expert there. When the pools cannot hold
+  them, the flag goes. The MXFP8 experts (layers 20-23) keep their layout, kernels, offload and CPU path. RTX 3090, every expert
   on the card, two runs each:
 
   | | Without | `--marlin 1` |
@@ -191,6 +194,6 @@ quarter.
 - One GPU. `--cpu-threads` on Linux only, at most two NUMA nodes.
 - `--spec` with the expert offload and no `--cpu-threads` copies a check's missing experts over PCIe: 16 tok/s on an
   8 GB card. Setup does not write that pair.
-- `--marlin 1` only with every expert on the card: with the expert offload or a GGUF file the flag is ignored, and
-  setup does not write it.
+- `--marlin 1` only with every NVFP4 expert on the card: with an NVFP4 pool smaller than that, `--kv-grow` or a GGUF
+  file the flag is ignored, and setup does not write it.
 - Not offered in `strata launch` or the desktop app yet.

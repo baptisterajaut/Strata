@@ -6,9 +6,14 @@
 // Scales: Marlin stores the e4m3 block scale * 2^7 as S0E5M3, exact for every normal e4m3 value; the checkpoint's
 // scale bytes are all in [76, 126] (measured over layers 0-19), so nothing is lost.  The per-expert global scale
 // stays an fp32 multiplier (* 2^7, GSCALE_MUL).
-// CBA: resident checkpoint experts only (no --vram-reserve-mib, no GGUF): the offload paths copy experts from host
-//      memory in the checkpoint layout (fetches, promotions, the PCIe share, prompt staging) and the CPU experts read
-//      it; upgrade path: repack_part after each of those copies, CPU-computed rows left out of k_m_plan.
+// With --vram-reserve-mib it runs when the NVFP4 pool holds every NVFP4 expert (setup_offload sizes that pool first
+// under the flag; the MXFP8 pool, the CPU experts and their copies keep the checkpoint layout): no NVFP4 expert is
+// ever fetched, promoted, shared over PCIe or streamed then.  The one path that empties NVFP4 slots, a picture's
+// encoder borrowing them (ink2_vision.cuh), refills them in the Marlin layout (marlin_refill).
+// CBA: an NVFP4 pool smaller than the NVFP4 experts (8-16 GB cards) and --kv-grow (which shrinks the pools) turn the
+//      flag off: the copies (k_fetch, k_fetch_bg, the PCIe share, the prompt staging) carry the checkpoint layout and
+//      the CPU-computed rows would need leaving out of the Marlin plans; upgrade path: a copy kernel that repacks as it
+//      reads mapped host memory, on every NVFP4 copy, and plans that skip null table entries.
 // CBA: the MXFP8 experts (layers 20-23, 4 of 48 layer passes) keep their layout and kernels: Marlin's MXFP8 kernels
 //      exist for bf16 activations only (8-bit mantissa); upgrade path: instantiate them and add a bf16 lane.
 #if !defined(STRATA_USE_HIP) && defined(STRATA_INK2_MARLIN)
@@ -19,23 +24,49 @@ struct MarlinState {
     int *sorted = nullptr, *eids = nullptr, *npad = nullptr;   // prompt / verify: blocks of rows per expert
     int *dsorted = nullptr, *dnpad = nullptr;                  // decode: 8 blocks of one row (the experts are E.ids)
     half *dx = nullptr, *dgu = nullptr, *dact = nullptr, *dey = nullptr;   // decode fp16 scratch
+    uint8_t* stage = nullptr;   // one NVFP4 expert in the checkpoint layout, for the time of its repack
     const float* gs13[NL] = {};
     const float* gs2[NL] = {};
 };
 MarlinState MS;
 
-// a layer's experts, checkpoint layout on the host -> Marlin layout in its pool range
-void marlin_load_layer(const uint8_t* lay, size_t bytes, uint8_t* dst) {
-    uint8_t* stage = nullptr;   // the layer in the checkpoint layout, for the time of the repack (573 MB)
-    CK(cudaMalloc(&stage, (size_t) NE * NV_BYTES));
-    CK(cudaMemcpy(stage, lay, bytes, cudaMemcpyHostToDevice));
-    for (int e = 0; e < NE; ++e) {
-        const size_t o = (size_t) e * NV_BYTES;
-        ink_marlin::repack_part(stage + o, dst + o, 2 * FF, H, cudaStreamPerThread);
-        ink_marlin::repack_part(stage + o + NV_A, dst + o + NV_A, H, FF, cudaStreamPerThread);
-    }
+// one NVFP4 expert, checkpoint layout in host memory -> Marlin layout at dst (its pool slot); synchronous
+void marlin_put_expert(const uint8_t* src, uint8_t* dst) {
+    if (!MS.stage) CK(cudaMalloc(&MS.stage, NV_BYTES));
+    CK(cudaMemcpy(MS.stage, src, NV_BYTES, cudaMemcpyHostToDevice));
+    ink_marlin::repack_part(MS.stage, dst, 2 * FF, H, cudaStreamPerThread);
+    ink_marlin::repack_part(MS.stage + NV_A, dst + NV_A, H, FF, cudaStreamPerThread);
     CK(cudaStreamSynchronize(cudaStreamPerThread));
-    CK(cudaFree(stage));
+}
+
+// a layer's experts, checkpoint layout on the host -> Marlin layout in its pool range (one expert staged at a time)
+void marlin_load_layer(const uint8_t* lay, size_t bytes, uint8_t* dst) {
+    for (size_t o = 0; o < bytes; o += NV_BYTES) marlin_put_expert(lay + o, dst + o);
+}
+
+// the slots [from, from + keys.size()) of the NVFP4 pool, emptied by a picture's encoder, get their experts back
+// (keys[i] = l * NE + e, or -1 for a slot that was empty): repacked, then owner / slot_of / tables restored
+__global__ void k_pool_restore(const int* __restrict__ keys, int n, int from, int* owner, int* slot_of,
+                               const uint8_t** tabA, const uint8_t** tabB, uint8_t* pool) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || keys[i] < 0) return;
+    const int s = from + i, key = keys[i];
+    uint8_t* d = pool + (size_t) s * NV_BYTES;
+    owner[s] = key;
+    slot_of[key] = s;
+    tabA[key] = d;
+    tabB[key] = d + NV_A;
+}
+void marlin_refill(const std::vector<int>& keys, int from) {
+    for (size_t i = 0; i < keys.size(); ++i)
+        if (keys[i] >= 0) marlin_put_expert(E.xh[keys[i]], E.pool_nv + (size_t) (from + (int) i) * NV_BYTES);
+    int* d = nullptr;   // (not dalloc: freed at once, kept out of g_vram)
+    CK(cudaMalloc(&d, keys.size() * 4));
+    CK(cudaMemcpy(d, keys.data(), keys.size() * 4, cudaMemcpyHostToDevice));
+    k_pool_restore<<<(unsigned) ((keys.size() + 255) / 256), 256>>>(d, (int) keys.size(), from, E.owner_nv, E.slot_of,
+                                                                    E.tabA, E.tabB, E.pool_nv);
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    CK(cudaFree(d));
 }
 
 int marlin_block(int T) { return T <= SMALL_T ? 8 : T <= 256 ? 16 : T < 2048 ? 32 : 64; }   // 3090 bench (mbench)
@@ -68,6 +99,7 @@ void marlin_alloc() {
     MS.dgu = (half*) dalloc((size_t) TOPK * 2 * FF * 2);
     MS.dact = (half*) dalloc((size_t) TOPK * FF * 2);
     MS.dey = (half*) dalloc((size_t) TOPK * H * 2);
+    if (!MS.stage) MS.stage = (uint8_t*) dalloc(NV_BYTES);   // before setup_offload measures the VRAM left
 }
 
 __global__ void k_mh_from_f32(const float* __restrict__ x, half* __restrict__ y, int n) {
@@ -154,6 +186,8 @@ void marlin_moe_b(const Layer& Y, const float* x, float* out, int T) {
     k_mh_combine<<<dim3(H / 256, T), 256>>>(gh, PF.slot, PF.wts, out);
 }
 #else
+void marlin_put_expert(const uint8_t*, uint8_t*) {}
+void marlin_refill(const std::vector<int>&, int) {}
 void marlin_load_layer(const uint8_t*, size_t, uint8_t*) {}
 void marlin_alloc() {}
 void marlin_moe(const Layer&, const float*, const float*, float*, const float*, float*) {}

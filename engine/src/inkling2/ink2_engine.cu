@@ -2694,6 +2694,7 @@ int g_slot = 0;   // the layer application being built (host side, baked into th
 // --marlin 1 (ink2_marlin.cuh): the NVFP4 experts in the Marlin layout, their products by the vendored Marlin kernels
 bool g_marlin = false;
 void marlin_load_layer(const uint8_t* lay, size_t bytes, uint8_t* dst);
+void marlin_put_expert(const uint8_t* src, uint8_t* dst);
 void marlin_moe(const Layer& Y, const float* x, const float* r, float* mhist, const float* mlp_conv, float* out);
 void marlin_moe_b(const Layer& Y, const float* x, float* out, int T);
 bool g_verify_tc = false;   // --verify-tc 1: small-T dense products on tensor cores (k_gemv_bf16_tc)
@@ -3246,6 +3247,18 @@ void setup_offload() {
     } else {
         E.nslot_mx = (int) std::min<size_t>((size_t) (budget * 0.2) / pool_slot(false), (size_t) (NL - MXFP8_FIRST) * NE);
         E.nslot_nv = (int) std::min<size_t>((budget - (size_t) E.nslot_mx * pool_slot(false)) / pool_slot(true), (size_t) MXFP8_FIRST * NE);
+        if (g_marlin) {   // --marlin: every NVFP4 expert first, the MXFP8 pool the rest; else the flag goes (ink2_marlin.cuh)
+            const size_t nv_all = (size_t) MXFP8_FIRST * NE * pool_slot(true);
+            const int mx = budget > nv_all ? (int) std::min<size_t>((budget - nv_all) / pool_slot(false), (size_t) (NL - MXFP8_FIRST) * NE) : 0;
+            if (mx >= FETCH_MAX) {
+                E.nslot_nv = MXFP8_FIRST * NE;
+                E.nslot_mx = mx;
+            } else {
+                std::fprintf(stderr, "[ink2] --marlin 1 ignored: the expert pools cannot hold every NVFP4 expert (%.2f GiB) "
+                                     "beside %d MXFP8 slots\n", nv_all / 1073741824.0, FETCH_MAX);
+                g_marlin = false;
+            }
+        }
     }
     if (E.nslot_nv < FETCH_MAX || (!one && E.nslot_mx < FETCH_MAX)) {
         std::fprintf(stderr, "offload: %.2f GiB free, reserve %d MiB: room for %d + %d expert slots (need >= %d each)\n",
@@ -3279,7 +3292,8 @@ void setup_offload() {
             if (used >= (nv ? E.nslot_nv : E.nslot_mx)) continue;
             const size_t eb = ex_bytes(l);
             uint8_t* d = (nv ? E.pool_nv : E.pool_mx) + (size_t) used * eb;
-            CK(cudaMemcpy(d, E.xh[(size_t) l * NE + e], eb, cudaMemcpyHostToDevice));
+            if (g_marlin && nv) marlin_put_expert(E.xh[(size_t) l * NE + e], d);
+            else CK(cudaMemcpy(d, E.xh[(size_t) l * NE + e], eb, cudaMemcpyHostToDevice));
             slot_of[l * NE + e] = used;
             (nv ? own_nv : own_mx)[used] = l * NE + e;
             E.htabA[l * NE + e] = d;
@@ -5589,13 +5603,13 @@ int main(int argc, char** argv) {
     // until IQ3_S / IQ4_NL / Q8_0 CPU dots and a GGUF drafter exist
     if (g_is_gguf && E.cpu) { std::fprintf(stderr, "--cpu-threads: not with a GGUF model (no GGUF CPU expert kernels yet)\n"); return 2; }
     if (g_is_gguf && spec) { std::fprintf(stderr, "--spec: not with a GGUF model (no drafter for it yet)\n"); return 2; }
-    if (g_marlin) {   // CBA (ink2_marlin.cuh): resident checkpoint experts on an Ampere or later NVIDIA card only
+    if (g_marlin) {   // CBA (ink2_marlin.cuh): checkpoint NVFP4 experts all on the card, Ampere or later NVIDIA only
         int cc = 0;
 #if !defined(STRATA_USE_HIP) && defined(STRATA_INK2_MARLIN)
         cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, 0);
 #endif
-        if (g_is_gguf || E.reserve_mib >= 0 || cc < 8) {
-            std::fprintf(stderr, "[ink2] --marlin 1 ignored: it needs the checkpoint, every expert on the card (no --vram-reserve-mib) and a CUDA card of compute capability 8.0 or later\n");
+        if (g_is_gguf || E.grow || cc < 8) {
+            std::fprintf(stderr, "[ink2] --marlin 1 ignored: it needs the checkpoint, no --kv-grow and a CUDA card of compute capability 8.0 or later\n");
             g_marlin = false;
         }
     }

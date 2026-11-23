@@ -251,7 +251,12 @@ __global__ void kv_gelu(float* __restrict__ y, const float* __restrict__ b, int 
 unsigned kv_grid(size_t n) { return (unsigned) std::min<size_t>((n + 255) / 256, 8192); }
 
 // -------------------------------------------------------------------------------------------------- the encode's VRAM
-struct VisArena { uint8_t* p = nullptr; size_t bytes = 0; int pool_saved = -1; };
+struct VisArena {
+    uint8_t* p = nullptr;
+    size_t bytes = 0;
+    int pool_saved = -1;
+    std::vector<int> lent;   // --marlin: the owners of the lent NVFP4 slots, given their experts back (marlin_refill)
+};
 void vis_graphs_drop() {   // the decode graph and the verify graphs bake the slot counts in (as pool_resize)
     if (E.exec) { CK(cudaGraphExecDestroy(E.exec)); E.exec = nullptr; }
     for (auto& x : g_vexec) if (x) { CK(cudaGraphExecDestroy(x)); x = nullptr; }
@@ -265,6 +270,10 @@ std::string vis_arena_get(VisArena& a, size_t bytes) {
         if (n < 2 * FETCH_MAX)
             return "the picture needs " + std::to_string(bytes >> 20) + " MiB of VRAM for its encoder, more than the expert pool can lend";
         if (E.cpu) promote_cancel();
+        if (g_marlin) {   // the pool holds every NVFP4 expert, and nothing may refetch one in the checkpoint layout
+            a.lent.resize(k);
+            CK(cudaMemcpy(a.lent.data(), E.owner_nv + n, (size_t) k * 4, cudaMemcpyDeviceToHost));
+        }
         k_pool_evict<<<(k + 255) / 256, 256>>>(E.owner_nv, E.slot_of, E.tabA, E.tabB, E.stamp_nv, n, ns);
         CK(cudaDeviceSynchronize());
         a.pool_saved = ns;
@@ -287,6 +296,10 @@ void vis_arena_put(VisArena& a) {
     CK(cudaDeviceSynchronize());
     if (a.pool_saved >= 0) {   // the slots come back empty (owner -1, stamp 0): the pool fills them on demand
         E.nslot_nv = a.pool_saved;
+        if (!a.lent.empty()) {   // --marlin: refilled now, in the Marlin layout (~16 ms for 42 slots, inferred)
+            marlin_refill(a.lent, a.pool_saved - (int) a.lent.size());
+            std::fprintf(stderr, "[vision] %zu NVFP4 experts put back in the Marlin layout\n", a.lent.size());
+        }
         vis_graphs_drop();
     } else if (a.p) {
         CK(cudaFree(a.p));
