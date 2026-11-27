@@ -4143,10 +4143,14 @@ void embed_row(int tok, float* out) {
 }
 
 // the token's embedding row (host table) into E.emb_in
+// The one-token uploads (the embedding here, the position in step / draft_run) copy from pageable host memory that is
+// gone or reused right after the call: synchronous copies.  cudaMemcpyAsync stages a pageable source before it returns
+// on CUDA; the HIP runtime may read it later.  Every decode step already waits for its logits, so this costs no
+// overlap there.
 void upload_embed(int tok) {
     vec e(H);
     embed_row(tok, e.data());
-    CK(cudaMemcpyAsync(E.emb_in, e.data(), H * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(E.emb_in, e.data(), H * 4, cudaMemcpyHostToDevice));
 }
 
 // one token: embedding in E.emb_in, position in E.d_pos; writes E.logits.  Device work only (captured in a graph):
@@ -5235,9 +5239,9 @@ void draft_device(int p);
 cudaGraphExec_t g_draft_exec = nullptr;
 void draft_run(int tok, int p) {
     upload_embed(tok);
-    CK(cudaMemcpyAsync(D.drafts, &tok, 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(D.drafts, &tok, 4, cudaMemcpyHostToDevice));   // (synchronous: see upload_embed)
     if (!E.graph) { draft_device(p); return; }
-    CK(cudaMemcpyToSymbolAsync(d_vpos, &p, 4, 0, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CK(cudaMemcpyToSymbol(d_vpos, &p, 4, 0, cudaMemcpyHostToDevice));
     if (!g_draft_exec) {
         cudaGraph_t g;
         CK(cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeRelaxed));
@@ -5629,7 +5633,7 @@ int main(int argc, char** argv) {
     vec logits(VOCAB);
     auto step = [&](int tok, int pos, bool want_logits) {
         kv_fit(pos + 1);
-        CK(cudaMemcpyAsync(E.d_pos, &pos, 4, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(E.d_pos, &pos, 4, cudaMemcpyHostToDevice));   // (synchronous: see upload_embed)
         upload_embed(tok);
         if (!E.graph) {
             forward_device();
