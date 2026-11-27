@@ -2692,6 +2692,7 @@ bool g_verify_tc = false;   // --verify-tc 1: small-T dense products on tensor c
 int g_rpw = 4;    // decode GEMV rows per warp, upper bound (INK2_RPW: 1, 2, 4, 8)
 int g_sel_rpw = 2;   // expert (selected) GEMV rows per warp (INK2_SEL_RPW: 1, 2, 4, 8)
 int g_grp_r = 4;   // small-T grouped expert GEMV rows per warp (INK2_GRP_R: 1, 2, 4)
+int g_gate_ks = 1;   // INK2_GATE_SPLITK=n (n divides 2H = 4608, up to 18): the message gates' down product in the prompt as n split-K SGEMMs
 int g_gemv_min_blocks = 164;   // bf16 GEMV: R halved until the grid has this many blocks (2 per SM; INK2_GEMV_MINB)
 
 Engine E;
@@ -4231,6 +4232,7 @@ struct Prefill {
     float* rows_host = nullptr;   // rows_argmax + rows_copy (sampling): the rows' softcapped logits [T][VOCAB] (pinned)
     bool rows_copy = false;
     float *spm = nullptr, *spl = nullptr, *spo = nullptr;   // kb_attn_tc key splits (verify)
+    float* gpart = nullptr;   // INK2_GATE_SPLITK: the gate down product's split-K partial sums [g_gate_ks][T][GATE_RANK]
 };
 constexpr int SPLIT_MAX = 64;
 #ifndef SPLIT_KEYS
@@ -4283,6 +4285,7 @@ void alloc_prefill() {
     PF.kc = pf_floats(T * KVD); PF.vc = pf_floats(T * KVD); PF.att = pf_floats(((T + 63) / 64 * 64) * QD);
     PF.attn_out = pf_floats(TH); PF.att2 = pf_floats(TH); PF.r = pf_floats(TH); PF.m = pf_floats(TH); PF.mn = pf_floats(TH);
     PF.moe = pf_floats(TH); PF.y2 = pf_floats(TH); PF.cat = pf_floats(2 * TH); PF.gdown = pf_floats(T * GATE_RANK);
+    if (g_gate_ks > 1) PF.gpart = pf_floats((size_t) g_gate_ks * T * GATE_RANK);
     PF.gfg = pf_floats(2 * TH); PF.rl = pf_floats(T * NE); PF.wts = pf_floats(T * TOPK);
     // One region, phases with disjoint lifetimes (saves ~217 KB per chunk token, 445 MB at chunk 2048):
     //   attention: P [T][np_max], rel [T][NQ][EXTENT];  MoE: gu [T*TOPK][2FF] then ey (same rows, H = 2FF) after the
@@ -4487,9 +4490,33 @@ void gemm(const DMat& W, const float* X, int ldx, float* Y, int ldy, int T) {
     sgemm(wf32(W), W.n, W.k, X, ldx, Y, ldy, T);
 }
 
+// Y[t][j] = the KS partial products summed in index order (deterministic); grid over n x T
+__global__ void kb_sum_parts(const float* __restrict__ part, float* __restrict__ y, int ldy, int ks, int n, int T) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * T) return;
+    const int t = i / n, j = i - t * n;
+    float s = part[i];
+    for (int k = 1; k < ks; ++k) s += part[(size_t) k * n * T + i];
+    y[(size_t) t * ldy + j] = s;
+}
+// INK2_GATE_SPLITK=n: the gates' down product has 64 outputs and K = 2H = 4608, so one SGEMM fills only a few CUs (1.7 TFLOP/s
+// measured on an RX 7900 XTX at T = 2048).  Split along K into n strided-batched SGEMMs and sum the partials in a fixed order:
+// fp32 either way, a different order of the sum.
+void gemm_gate_down(const DMat& W, const float* X, int ldx, float* Y, int ldy, int T) {
+    if (T <= SMALL_T || g_gate_ks <= 1 || !PF.gpart || W.k % g_gate_ks) { gemm(W, X, ldx, Y, ldy, T); return; }
+    const float one = 1.0f, zero = 0.0f;
+    const int ks = g_gate_ks, Kc = W.k / ks;
+    if (cublasSgemmStridedBatched(PF.cb, CUBLAS_OP_T, CUBLAS_OP_N, W.n, T, Kc, &one, wf32(W), W.k, (long long) Kc, X, ldx, (long long) Kc,
+                                  &zero, PF.gpart, W.n, (long long) W.n * T, ks) != CUBLAS_STATUS_SUCCESS) {
+        std::fprintf(stderr, "cublasSgemmStridedBatched failed (%d x %d x %d, %d batches)\n", W.n, T, Kc, ks);
+        std::exit(1);
+    }
+    kb_sum_parts<<<(unsigned) ((W.n * T + 255) / 256), 256>>>(PF.gpart, Y, ldy, ks, W.n, T);
+}
+
 void message_gate_b(const Gate& g, const float* x, int sx, const float* m, int sm, const float* nw, float* yn, int T) {
     kb_rms2<<<dim3(2, T), 512>>>(x, sx, m, sm, PF.cat);
-    gemm(g.down, PF.cat, 2 * H, PF.gdown, GATE_RANK, T);
+    gemm_gate_down(g.down, PF.cat, 2 * H, PF.gdown, GATE_RANK, T);
     gemm(g.fg, PF.gdown, GATE_RANK, PF.gfg, 2 * H, T);
     kb_gate_mix_rms<<<T, 512>>>(x, sx, m, sm, PF.gfg, nw, yn);
 }
@@ -5483,6 +5510,7 @@ int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_RPW")) g_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_SEL_RPW")) g_sel_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_GEMV_MINB")) g_gemv_min_blocks = std::atoi(r);
+    if (const char* r = std::getenv("INK2_GATE_SPLITK")) g_gate_ks = std::max(1, std::min(18, std::atoi(r)));
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
     if (const char* r = std::getenv("INK2_GRP_R")) g_grp_r = std::atoi(r);
     if (const char* r = std::getenv("INK2_DRAFT_ABL")) g_draft_abl = std::atoi(r);
