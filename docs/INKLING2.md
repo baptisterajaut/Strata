@@ -103,9 +103,10 @@ which is why the 16 GB card at 128K stays without the drafter.
   there even when the client sends the history back without the model's reasoning, conversations set aside (an
   agent and its subagents taking turns) are taken up again, and conversations sharing a long beginning (a system
   prompt and tools) read it once. `--conversation-cache-min-tokens N` (512): shorter conversations are not kept.
-- `--serve` also takes `SAVE <path>` and `LOAD <path>`: the K/V of the live conversation to a file and back, so that a
-  long prompt is not read again after a restart. A file works only with the same `--kv` and `--spec` (a LOAD with
-  others is refused) and the same model; `--chunk`, `--max-context` and `--kv-grow` may differ.
+- Disk sessions: `--serve` takes the server's `SAVE <path>` and `RESTORE <path>`, so the server's
+  `POST /slots/0?action=save|restore` (with `--slot-save-path`) and the conversation kept across an image job's unload
+  work with this engine. A long prompt is not read again after a restart. A file works only with the same model, `--kv`
+  and `--spec` (a RESTORE with others is refused); `--chunk`, `--max-context` and `--kv-grow` may differ.
 - Pictures need no flag. The ViT is read into RAM at the first picture and streamed to the card for each one, so
   text-only use costs no VRAM; with offload it borrows a few hundred MiB of expert slots while it runs. A picture
   over `--image-max-tokens N` (4096; one token is a 40x40 pixel tile) is scaled down.

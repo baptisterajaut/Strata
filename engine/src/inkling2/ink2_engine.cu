@@ -5477,7 +5477,7 @@ int sample(const vec& lg, Sampler& s) { return sample(lg.data(), s); }
 constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_config.json)
 
 #include "ink2_session.cuh"
-#include "ink2_snapshot.cuh"   // --serve: SAVE <path> / LOAD <path>, the K/V of a conversation to and from a file
+#include "ink2_snapshot.cuh"   // --serve: SAVE <path> / RESTORE <path>, Strata's disk sessions (the conversation's K/V in a file)
 
 }  // namespace
 
@@ -5773,15 +5773,8 @@ int main(int argc, char** argv) {
                 q.pop_front();
             }
             if (line == "QUIT") break;
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("LOAD ", 0) == 0) {   // K/V snapshots (ink2_snapshot.cuh)
-                const bool save = line[0] == 'S';
-                size_t nbytes = 0;
-                const double w0 = now_ms();
-                const std::string err = save ? snap_save(line.substr(5), hist, last_logits, nbytes)
-                                             : snap_load(line.substr(5), hist, last_logits, nbytes);
-                if (!err.empty()) std::printf("ERR %s\n", err.c_str());
-                else std::printf("%s %zu %zu %.0f\n", save ? "SAVED" : "LOADED", hist.size(), nbytes, now_ms() - w0);
-                std::fflush(stdout);
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {   // disk sessions (ink2_snapshot.cuh)
+                snap_command(line, hist, last_logits);
                 continue;
             }
             if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
