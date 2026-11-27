@@ -564,9 +564,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata-q36ref PRIVATE strata_kernels strata_warnings ${_strata_gpu_runtime_target})
   # NEW-MODELS-PLAN.md T1: Inkling-2-Mini's reference path (the thinkingmachines safetensors as shipped: BF16, NVFP4 and
   # MXFP8 experts; one GPU, the model resident, plain kernels), checked against transformers by terminal/tools/inkling2/
-  # HIP: Linux only (the engine uses POSIX calls) and out of the default target, so a plain HIP build of the other
-  # engines does not compile it; setup builds it by name
-  if(STRATA_ENABLE_CUDA OR (STRATA_ENABLE_HIP AND NOT WIN32))
+  # HIP: out of the default target, so a plain HIP build of the other engines does not compile it; setup builds it by
+  # name.  On Windows the engine reads the safetensors checkpoint only (reading a GGUF directly maps it with mmap)
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(strata-ink2ref src/inkling2/ink2ref.cu)
     target_include_directories(strata-ink2ref PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(strata-ink2ref PRIVATE strata_warnings ${_strata_gpu_runtime_target})
@@ -580,6 +580,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_compile_options(strata-ink2 PRIVATE
       $<$<COMPILE_LANGUAGE:CUDA>:--default-stream=per-thread>
       $<$<COMPILE_LANGUAGE:HIP>:-fgpu-default-stream=per-thread>)
+    if(STRATA_ENABLE_HIP AND WIN32)
+      # the shim's cudaMemGetInfo is strata::hip_compat::mem_get_info on Windows (src/core/device.cu: the WDDM budget)
+      target_link_libraries(strata-ink2 PRIVATE strata_core)
+    endif()
     if(STRATA_ENABLE_HIP)
       set_target_properties(strata-ink2ref strata-ink2 PROPERTIES EXCLUDE_FROM_ALL ON)
     endif()

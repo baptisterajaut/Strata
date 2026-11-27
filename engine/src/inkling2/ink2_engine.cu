@@ -58,9 +58,11 @@
 #include <string>
 #include <vector>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/mman.h>   // gg_open maps GGUF files with mmap (POSIX only)
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -2933,6 +2935,10 @@ size_t gg_row_bytes(uint32_t type, int64_t ne0) {
 }
 #include "ink2_gguf_experts.cuh"
 std::string gg_open(const std::string& path, Gguf& g) {
+#ifdef _WIN32
+    (void) g;
+    return "reading a GGUF file directly needs mmap, which this Windows build does not have (" + path + "): use the safetensors checkpoint";
+#else
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) return "cannot open " + path;
     struct stat st{};
@@ -2996,6 +3002,7 @@ std::string gg_open(const std::string& path, Gguf& g) {
         x.data = g.base + data + o.second;
     }
     return "";
+#endif
 }
 
 const Gguf* g_gg = nullptr;
