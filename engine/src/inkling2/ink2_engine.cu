@@ -42,6 +42,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
@@ -5476,6 +5477,7 @@ int sample(const vec& lg, Sampler& s) { return sample(lg.data(), s); }
 constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_config.json)
 
 #include "ink2_session.cuh"
+#include "ink2_snapshot.cuh"   // --serve: SAVE <path> / RESTORE <path>, Strata's disk sessions (the conversation's K/V in a file)
 
 }  // namespace
 
@@ -5771,6 +5773,10 @@ int main(int argc, char** argv) {
                 q.pop_front();
             }
             if (line == "QUIT") break;
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {   // disk sessions (ink2_snapshot.cuh)
+                snap_command(line, hist, last_logits);
+                continue;
+            }
             if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             stop.store(false);
             std::vector<std::string> f;
