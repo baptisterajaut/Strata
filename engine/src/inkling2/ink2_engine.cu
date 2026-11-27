@@ -25,6 +25,7 @@
 #include "ink2_cpu.hpp"
 #include "ink2_iq_tables.h"
 #include "ink2_image.hpp"
+#include "ink2_relpos_fa.h"   // INK2_RELFA=1: fused relative-bias flash attention for the int8-KV prefill (HIP only)
 
 #if !defined(STRATA_USE_HIP)
 #include <cuda.h>
@@ -1155,6 +1156,28 @@ __global__ void kb_kv_store(const float* kc, const float* vc, void* K, void* V, 
     const size_t row = (size_t) ((pos0 + t) % cap);
     kv_st<false>(K, ksc, row, g * HD + i, kv * fminf(QK_CLIP / (kn + 1e-6f), 1.0f));
     kv_st<true>(V, vsc, row, g * HD + i, vv * vr);
+}
+
+// rel_proj [DREL][EXTENT] -> [EXTENT][DREL] (INK2_RELFA: the fused attention reads one distance's 16 values at once)
+__global__ void kb_relproj_t(const float* __restrict__ src, float* __restrict__ dst) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < EXTENT * DREL) dst[i] = src[(i % DREL) * EXTENT + i / DREL];
+}
+// INK2_RELFA_CMP=1 (diagnostic): stat[off + 0..3] = max |a - ref|, max |ref|, sum |a - ref|, sum |ref|; stat[8 + off / 4] counts
+// values of a that are not finite.  block = 256
+__global__ void k_cmp_n(const float* __restrict__ a, const float* __restrict__ ref, size_t n, float* stat, int off) {
+    float md = 0.0f, mr = 0.0f, sd = 0.0f, sr = 0.0f, nf = 0.0f;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float x = a[i], d = fabsf(x - ref[i]), r = fabsf(ref[i]);
+        if (!(fabsf(x) < 1e30f)) { nf += 1.0f; continue; }
+        md = fmaxf(md, d); mr = fmaxf(mr, r); sd += d; sr += r;
+    }
+    md = block_max(md); mr = block_max(mr); sd = block_sum(sd); sr = block_sum(sr); nf = block_sum(nf);
+    if (!threadIdx.x) {
+        atomicMax(reinterpret_cast<unsigned*>(stat + off), __float_as_uint(md));
+        atomicMax(reinterpret_cast<unsigned*>(stat + off + 1), __float_as_uint(mr));
+        atomicAdd(stat + off + 2, sd); atomicAdd(stat + off + 3, sr); atomicAdd(stat + 8 + off / 4, nf);
+    }
 }
 
 // rel[t][h][d] = sum_r rs_t[h][r] proj[r][d]; grid (NQ, T)
@@ -2576,6 +2599,7 @@ struct Layer {
     // one launch when the query, key and value inputs are the same vector, three otherwise
     DMat proj, wo, router;
     int off_k = 0, off_v = 0, n_k = 0, n_v = 0;
+    const float *rel_projT = nullptr;   // INK2_RELFA: rel_proj transposed [EXTENT][DREL]
     const float *q_scale, *rel_scale, *rel_proj, *k_conv = nullptr, *v_conv = nullptr, *k_static = nullptr,
                 *v_static = nullptr, *attn_conv, *mlp_conv, *attn_norm = nullptr, *q_norm = nullptr,
                 *k_norm = nullptr, *v_norm = nullptr, *mlp_norm, *attn_query = nullptr, *mlp_query, *router_bias;
@@ -2692,6 +2716,8 @@ bool g_verify_tc = false;   // --verify-tc 1: small-T dense products on tensor c
 int g_rpw = 4;    // decode GEMV rows per warp, upper bound (INK2_RPW: 1, 2, 4, 8)
 int g_sel_rpw = 2;   // expert (selected) GEMV rows per warp (INK2_SEL_RPW: 1, 2, 4, 8)
 int g_grp_r = 4;   // small-T grouped expert GEMV rows per warp (INK2_GRP_R: 1, 2, 4)
+bool g_relfa = false;            // INK2_RELFA=1: int8-KV prefill attention through the fused kernel of ink2_relpos_fa.h (HIP builds)
+float* g_relfa_stat = nullptr;   // INK2_RELFA_CMP=1 (with INK2_RELFA=1): both prefill attentions on every call, compared (diagnostic)
 int g_gemv_min_blocks = 164;   // bf16 GEMV: R halved until the grid has this many blocks (2 per SM; INK2_GEMV_MINB)
 
 Engine E;
@@ -4231,6 +4257,7 @@ struct Prefill {
     float* rows_host = nullptr;   // rows_argmax + rows_copy (sampling): the rows' softcapped logits [T][VOCAB] (pinned)
     bool rows_copy = false;
     float *spm = nullptr, *spl = nullptr, *spo = nullptr;   // kb_attn_tc key splits (verify)
+    float* att_ref = nullptr;   // INK2_RELFA_CMP: kb_attn_tc's output kept for the comparison
 };
 constexpr int SPLIT_MAX = 64;
 #ifndef SPLIT_KEYS
@@ -4328,6 +4355,19 @@ void alloc_prefill() {
         if (g_is_gguf) for (auto& d : g_dq) d = (half*) dalloc((size_t) 2 * FF * H * 2);   // one expert part (w13: 2FF x H)
         PF.xh = (half*) pf_alloc(3 * T * QD * 2);
         PF.qh = (half*) pf_alloc(((T + 63) / 64 * 64) * QD * 2);
+#ifdef STRATA_USE_HIP
+        if (g_relfa && (E.kvm == 2 || E.kvm == 3)) {
+            for (int l = 0; l < NL; ++l) {
+                float* t = dfloats((size_t) EXTENT * DREL);
+                kb_relproj_t<<<(EXTENT * DREL + 255) / 256, 256>>>(E.L[l].rel_proj, t);
+                E.L[l].rel_projT = t;
+            }
+            if (std::getenv("INK2_RELFA_CMP")) {
+                g_relfa_stat = dfloats(16);
+                PF.att_ref = pf_floats(((T + 63) / 64 * 64) * QD);
+            }
+        }
+#endif
     }
     // cuBLAS loads its kernels and workspace at the first call of each shape class: run them once now, before the
     // expert pools take the free memory (a first prompt after that would find only the reserve)
@@ -4541,8 +4581,34 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
     }
     kb_kv_store<<<dim3(NKV, T), HD>>>(PF.kc, PF.vc, S.K, S.V, S.ksc, S.vsc, S.cap, pos0);
     kb_head_clip<<<dim3(NQ, T), 128>>>(P + OFF_REL, np, Y.rel_scale, DREL, REL_CLIP, Y.full, pos0);
-    kb_rel_logits<<<dim3(NQ, T), 256>>>(P + OFF_REL, np, Y.rel_proj, PF.rel);
-    if (PF.tc) {
+#ifdef STRATA_USE_HIP
+    // INK2_RELFA=1: the fused kernel computes the bias itself, so the [T][NQ][EXTENT] table is not made (unless INK2_RELFA_CMP
+    // compares both); int8 caches only, prompt chunks only (the verify blocks keep kb_attn_tc)
+    const bool relfa = PF.tc && g_relfa && (E.kvm == 2 || E.kvm == 3) && T > SMALL_T && pos0 >= 0 && Y.rel_projT;
+#else
+    const bool relfa = false;
+#endif
+    auto launch_relfa = [&](float* dst) {
+#ifdef STRATA_USE_HIP
+        inkfa::Params fp{};
+        fp.q = P; fp.q_s1 = np;
+        fp.K = static_cast<const int8_t*>(S.K); fp.V = static_cast<const int8_t*>(S.V);
+        fp.ksc = reinterpret_cast<const uint16_t*>(S.ksc); fp.vsc = reinterpret_cast<const uint16_t*>(S.vsc);
+        fp.cap = S.cap;
+        fp.R = P + OFF_REL; fp.R_s1 = np; fp.rbT = Y.rel_projT;
+        fp.sink = P + OFF_SINK; fp.sink_s1 = np; fp.out = dst;
+        fp.T = T; fp.pos0 = pos0; fp.window = S.full ? 0 : WINDOW; fp.H = NQ; fp.Hkv = NKV; fp.extent = EXTENT;
+        fp.scale = 0.08838834764831845f;   // 1 / sqrt(HD)
+        constexpr int NQT = 4, TK = 32;     // 64 queries x 3 heads per block, 32-key tiles (measured best on gfx1100)
+        inkfa::relpos_fa_i8<NREP, NQT, TK><<<dim3((T + 16 * NQT - 1) / (16 * NQT), NKV), 32 * NREP * NQT, inkfa::smem_bytes<NREP, NQT, TK>()>>>(fp);
+#else
+        (void) dst;
+#endif
+    };
+    if (!relfa || g_relfa_stat) kb_rel_logits<<<dim3(NQ, T), 256>>>(P + OFF_REL, np, Y.rel_proj, PF.rel);
+    if (relfa && !g_relfa_stat) {
+        launch_relfa(PF.att);
+    } else if (PF.tc) {
         const size_t nqh = (size_t) T * QD;
         kb_f32_to_f16<<<(unsigned) ((nqh + 255) / 256), 256>>>(P, np, QD, PF.qh, nqh);
         // verify blocks: the keys split over blocks (8 blocks would walk the whole context otherwise)
@@ -4555,6 +4621,11 @@ void attention_b(const Layer& Y, Slot& S, const float* xq, int sq, const float* 
                                                                  S.full ? 0 : WINDOW, pos0, T, PF.att, ns, PF.spm,
                                                                  PF.spl, PF.spo);
         if (ns > 1) kb_attn_merge_split<<<dim3(NQ, T), HD>>>(PF.spm, PF.spl, PF.spo, ns, PF.att);
+        if (relfa && g_relfa_stat) {   // diagnostic: kb_attn_tc's result is the reference, the fused kernel's result carries on
+            CK(cudaMemcpyAsync(PF.att_ref, PF.att, nqh * 4, cudaMemcpyDeviceToDevice));
+            launch_relfa(PF.att);
+            k_cmp_n<<<256, 256>>>(PF.att, PF.att_ref, nqh, g_relfa_stat, S.full ? 0 : 4);
+        }
     } else {
         kb_attn<<<dim3((T + FQ - 1) / FQ, NQ), 256, FA_SMEM>>>(P, np, S.K, S.V, S.ksc, S.vsc, PF.rel, S.cap, S.full ? 0 : WINDOW, pos0,
                                                              T, PF.att);
@@ -5479,10 +5550,27 @@ constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_c
 
 }  // namespace
 
+// INK2_RELFA: the fused kernel is gfx11 WMMA (ink2_relpos_fa.h); on any other card the prompt attention stays kb_attn_tc
+bool relfa_card_ok() {
+#ifdef STRATA_USE_HIP
+    int dev = 0;
+    hipDeviceProp_t p{};
+    if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); return false; }
+    return std::strncmp(p.gcnArchName, "gfx11", 5) == 0;
+#else
+    return false;
+#endif
+}
+
 int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_RPW")) g_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_SEL_RPW")) g_sel_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_GEMV_MINB")) g_gemv_min_blocks = std::atoi(r);
+    if (const char* r = std::getenv("INK2_RELFA")) g_relfa = std::atoi(r) != 0;
+    if (g_relfa && !relfa_card_ok()) {
+        std::fprintf(stderr, "INK2_RELFA: the fused attention needs a gfx11 card (HIP build): the prompt attention stays kb_attn_tc\n");
+        g_relfa = false;
+    }
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
     if (const char* r = std::getenv("INK2_GRP_R")) g_grp_r = std::atoi(r);
     if (const char* r = std::getenv("INK2_DRAFT_ABL")) g_draft_abl = std::atoi(r);
@@ -5974,6 +6062,13 @@ int main(int argc, char** argv) {
         FILE* f = std::fopen(rec_path.c_str(), "wb");
         std::fwrite(r.data(), 4, rec_n, f);
         std::fclose(f);
+    }
+    if (g_relfa_stat) {
+        float s[16];
+        CK(cudaMemcpy(s, g_relfa_stat, 64, cudaMemcpyDeviceToHost));
+        std::printf("\nINK2_RELFA_CMP, fused attention vs kb_attn_tc (same inputs, every prompt chunk):\n");
+        std::printf("  global layers : max |diff| %.3e, max |ref| %.3e, mean relative difference %.3e, non-finite values %.0f\n", s[0], s[1], s[2] / std::max(s[3], 1e-30f), s[8]);
+        std::printf("  sliding layers: max |diff| %.3e, max |ref| %.3e, mean relative difference %.3e, non-finite values %.0f\n", s[4], s[5], s[6] / std::max(s[7], 1e-30f), s[9]);
     }
     std::printf("\nprompt %zu tokens %.0f ms (%.1f tok/s), decode %d tokens %.0f ms (%.1f tok/s)\n", ids.size(), t1 - t0,
                 1000.0 * ids.size() / (t1 - t0), n_gen, t2 - t1, n_gen > 0 ? 1000.0 * n_gen / (t2 - t1) : 0.0);
