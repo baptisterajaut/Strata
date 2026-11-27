@@ -70,25 +70,30 @@ struct Sess {
     std::string note;      // this request's log line
 } g_sess;
 
-void sess_init(int mib, int min_tokens) {
-    if (mib <= 0) return;
-    g_sess.min_tokens = min_tokens;
+// the arrays of the state described above (also the K/V snapshots' layout, ink2_snapshot.cuh)
+void sess_arrays(std::vector<SessArr>& full, std::vector<SessArr>& ring, std::vector<std::pair<void*, size_t>>& conv) {
     for (int s = 0; s < NCALLS; ++s) {
         Slot& S = E.S[s];
         void* arr[4] = {S.K, S.V, S.ksc, S.vsc};
         for (int a = 0; a < 4; ++a) {
             const size_t b = kv_cell_bytes(a);
             if (!b) continue;
-            (S.full ? g_sess.full : g_sess.ring).push_back({(uint8_t*) arr[a], b, S.cap});
+            (S.full ? full : ring).push_back({(uint8_t*) arr[a], b, S.cap});
         }
-        g_sess.conv.push_back({S.khist, (size_t) HR * KVD * 4});
-        g_sess.conv.push_back({S.vhist, (size_t) HR * KVD * 4});
-        g_sess.conv.push_back({S.ahist, (size_t) HR * H * 4});
-        g_sess.conv.push_back({S.mhist, (size_t) HR * H * 4});
+        conv.push_back({S.khist, (size_t) HR * KVD * 4});
+        conv.push_back({S.vhist, (size_t) HR * KVD * 4});
+        conv.push_back({S.ahist, (size_t) HR * H * 4});
+        conv.push_back({S.mhist, (size_t) HR * H * 4});
     }
     if (D.on)
         for (int i = 0; i < DL; ++i)
-            for (__half* x : {D.L[i].K, D.L[i].V}) (D.L[i].local ? g_sess.ring : g_sess.full).push_back({(uint8_t*) x, (size_t) KVD * 2, D.L[i].cap});
+            for (__half* x : {D.L[i].K, D.L[i].V}) (D.L[i].local ? ring : full).push_back({(uint8_t*) x, (size_t) KVD * 2, D.L[i].cap});
+}
+
+void sess_init(int mib, int min_tokens) {
+    if (mib <= 0) return;
+    g_sess.min_tokens = min_tokens;
+    sess_arrays(g_sess.full, g_sess.ring, g_sess.conv);
     for (auto& a : g_sess.ring) g_sess.tail_bytes += (size_t) WINDOW * a.b;
     for (auto& c : g_sess.conv) g_sess.tail_bytes += c.second;
     for (auto& a : g_sess.full) g_sess.row_bytes += a.b;
