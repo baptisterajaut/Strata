@@ -2692,6 +2692,8 @@ bool g_verify_tc = false;   // --verify-tc 1: small-T dense products on tensor c
 int g_rpw = 4;    // decode GEMV rows per warp, upper bound (INK2_RPW: 1, 2, 4, 8)
 int g_sel_rpw = 2;   // expert (selected) GEMV rows per warp (INK2_SEL_RPW: 1, 2, 4, 8)
 int g_grp_r = 4;   // small-T grouped expert GEMV rows per warp (INK2_GRP_R: 1, 2, 4)
+bool g_unembed_guard = false;     // INK2_UNEMBED_GUARD=1: after each prompt, time the unembedding product and re-home the matrix if it is slow
+float g_unembed_slow_ms = 8.0f;   // INK2_UNEMBED_SLOW_MS: the time above which the product counts as slow
 int g_gemv_min_blocks = 164;   // bf16 GEMV: R halved until the grid has this many blocks (2 per SM; INK2_GEMV_MINB)
 
 Engine E;
@@ -5479,10 +5481,63 @@ constexpr int EOS_ID = 200006;   // <|content_model_end_sampling|> (generation_c
 
 }  // namespace
 
+// Unembedding guard (opt-in: INK2_UNEMBED_GUARD=1).  The unembedding matrix (0.92 GB BF16) is read once per decoded token.  On
+// Windows, when the card is nearly full and another process (the desktop compositor, a browser) asks for more video memory, the
+// driver can move one of our buffers to system memory.  If that buffer is the unembedding matrix, every token then reads it over
+// PCIe: on an RX 7900 XTX, about 30 ms per token instead of about 1.7 ms, for the rest of the process.  After a prompt the product
+// is timed (two runs, the faster one counts); when it is slower than INK2_UNEMBED_SLOW_MS (default 8 ms) the matrix is copied into
+// a new allocation, and if the copy is fast the old buffer is freed and the decode graph (which holds the old pointer) is
+// captured again on the next token.  Not used with --spec (its graphs hold the pointer too) or with a Q8_0 (GGUF) unembedding.
+float* g_guard_scratch = nullptr;
+float time_unembed_product() {
+    if (!g_guard_scratch) CK(cudaMalloc(&g_guard_scratch, (size_t) VOCAB_ROWS * 4));
+    cudaEvent_t e0, e1;
+    CK(cudaEventCreate(&e0)); CK(cudaEventCreate(&e1));
+    float best = 1e30f;
+    for (int rep = 0; rep < 2; ++rep) {
+        CK(cudaEventRecord(e0));
+        gemv(E.unembed, E.mn, g_guard_scratch, VOCAB);
+        CK(cudaEventRecord(e1)); CK(cudaEventSynchronize(e1));
+        float ms = 0; CK(cudaEventElapsedTime(&ms, e0, e1));
+        best = std::min(best, ms);
+    }
+    CK(cudaEventDestroy(e0)); CK(cudaEventDestroy(e1));
+    return best;
+}
+void unembed_guard(bool spec) {
+    if (!g_unembed_guard || spec || !E.unembed.d || E.unembed.q) return;
+    const float t = time_unembed_product();
+    if (t <= g_unembed_slow_ms) return;
+    std::fprintf(stderr, "[unembed guard] the unembedding product takes %.1f ms (over %.1f ms): copying the matrix into a new allocation\n",
+                 t, g_unembed_slow_ms);
+    const size_t bytes = (size_t) E.unembed.n * E.unembed.k * 2;
+    void* nd = nullptr;
+    if (cudaMalloc(&nd, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "[unembed guard] no room for a copy (%.0f MiB): keeping the matrix where it is\n", bytes / 1048576.0);
+        return;
+    }
+    CK(cudaMemcpy(nd, E.unembed.d, bytes, cudaMemcpyDeviceToDevice));
+    const DMat old = E.unembed;
+    E.unembed.d = (const uint16_t*) nd;
+    const float t2 = time_unembed_product();
+    if (t2 < 0.5f * t && t2 <= g_unembed_slow_ms) {
+        CK(cudaFree((void*) old.d));
+        if (E.exec) { CK(cudaGraphExecDestroy(E.exec)); E.exec = nullptr; }   // captured again by the next decode step
+        std::fprintf(stderr, "[unembed guard] the copy is fast: the product now takes %.2f ms\n", t2);
+    } else {
+        E.unembed = old;
+        CK(cudaFree(nd));
+        std::fprintf(stderr, "[unembed guard] the copy is not faster (%.1f ms): keeping the old matrix\n", t2);
+    }
+}
+
 int main(int argc, char** argv) {
     if (const char* r = std::getenv("INK2_RPW")) g_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_SEL_RPW")) g_sel_rpw = std::atoi(r);
     if (const char* r = std::getenv("INK2_GEMV_MINB")) g_gemv_min_blocks = std::atoi(r);
+    if (const char* r = std::getenv("INK2_UNEMBED_GUARD")) g_unembed_guard = std::atoi(r) != 0;
+    if (const char* r = std::getenv("INK2_UNEMBED_SLOW_MS")) g_unembed_slow_ms = (float) std::atof(r);
     if (const char* r = std::getenv("INK2_OFF_MARGIN_MIB")) g_off_margin_mib = std::atoi(r);
     if (const char* r = std::getenv("INK2_GRP_R")) g_grp_r = std::atoi(r);
     if (const char* r = std::getenv("INK2_DRAFT_ABL")) g_draft_abl = std::atoi(r);
@@ -5848,6 +5903,7 @@ int main(int argc, char** argv) {
                 pf_unmap();
             }
             sess_prompt_end(pr, logits);
+            unembed_guard(spec);
             const double t1 = now_ms();
             std::vector<int> gen;
             const char* finish = "length";
@@ -5947,6 +6003,7 @@ int main(int argc, char** argv) {
         }
     }
     CK(cudaDeviceSynchronize());
+    unembed_guard(spec);
     const double t1 = now_ms();
     if (fg) std::fclose(fg);
     unsigned long long fb1 = 0, fb2 = 0;
